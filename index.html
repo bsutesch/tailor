@@ -1,0 +1,3377 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Tailor — Application Intelligence | Polite Robot</title>
+<meta name="description" content="Tailor helps job applicants position their experience for specific roles using live UX/Product job market intelligence." />
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap" rel="stylesheet">
+<style>
+  html, body { margin: 0; padding: 0; }
+  #root { min-height: 100vh; }
+</style>
+</head>
+<body>
+<div id="root"></div>
+
+<!-- React -->
+<script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+<script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+<!-- In-browser JSX transform. This is the same approach used for Ledger, Loupe,
+     and Prism: no build step, the browser transpiles JSX at load time. -->
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+
+<script type="text/babel" data-presets="react" data-type="module">
+const { useState, useEffect, useRef, useCallback, useMemo } = React;
+
+// ─── FILE EXTRACTION ────────────────────────────────────────────────────────
+let _pdfjsLib = null;
+function loadPdfScript(src) {
+  return new Promise((resolve, reject) => {
+    const existing = document.querySelector('script[data-pdfjs="1"]');
+    if (existing && window.pdfjsLib) return resolve();
+    const s = document.createElement("script");
+    s.src = src;
+    s.setAttribute("data-pdfjs", "1");
+    s.onload = () => resolve();
+    s.onerror = () => reject(new Error("script load failed"));
+    document.head.appendChild(s);
+  });
+}
+async function loadPdfJs() {
+  if (_pdfjsLib) return _pdfjsLib;
+  // Load the UMD build, which registers window.pdfjsLib. Try two CDNs.
+  const cdns = [
+    "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js",
+    "https://cdn.jsdelivr.net/npm/pdfjs-dist@3.11.174/build/pdf.min.js",
+  ];
+  let loaded = false;
+  for (const url of cdns) {
+    try {
+      await loadPdfScript(url);
+      if (window.pdfjsLib) { loaded = true; break; }
+    } catch (e) { /* try next */ }
+  }
+  if (!loaded || !window.pdfjsLib) throw new Error("pdfjs unavailable");
+  window.pdfjsLib.GlobalWorkerOptions.workerSrc =
+    "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js";
+  _pdfjsLib = window.pdfjsLib;
+  return _pdfjsLib;
+}
+
+function loadMammoth() {
+  return new Promise((resolve, reject) => {
+    if (window.mammoth) return resolve(window.mammoth);
+    const s = document.createElement("script");
+    s.src = "https://cdn.jsdelivr.net/npm/mammoth@1.8.0/mammoth.browser.min.js";
+    s.onload = () => resolve(window.mammoth);
+    s.onerror = () => reject(new Error("Could not load the Word document reader."));
+    document.head.appendChild(s);
+  });
+}
+
+async function extractFileText(file) {
+  const name = (file.name || "").toLowerCase();
+  try {
+    if (name.endsWith(".md") || name.endsWith(".txt")) {
+      return sanitizeText(await file.text());
+    }
+    if (name.endsWith(".docx")) {
+      const mammoth = await loadMammoth();
+      const buf = await file.arrayBuffer();
+      const result = await mammoth.extractRawText({ arrayBuffer: buf });
+      return sanitizeText(result.value);
+    }
+    if (name.endsWith(".pdf")) {
+      let pdfjs;
+      try {
+        pdfjs = await loadPdfJs();
+      } catch (e) {
+        throw new Error("Could not load the PDF reader. Check your connection, or upload a .docx instead.");
+      }
+      const buf = await file.arrayBuffer();
+      const pdf = await pdfjs.getDocument({ data: new Uint8Array(buf) }).promise;
+      let text = "";
+      for (let i = 1; i <= pdf.numPages; i++) {
+        const page = await pdf.getPage(i);
+        const content = await page.getTextContent();
+        // Rebuild lines: pdf.js emits positioned fragments, so join fragments on
+        // the same baseline and break when the vertical position changes or the
+        // item is flagged as ending a line. Joining everything with spaces (the
+        // naive approach) destroys headings and bullets.
+        let lastY = null;
+        let line = "";
+        const lines = [];
+        content.items.forEach(item => {
+          if (!item) return;
+          const str = item.str || "";
+          const y = item.transform ? Math.round(item.transform[5]) : null;
+          if (lastY !== null && y !== null && Math.abs(y - lastY) > 2) {
+            lines.push(line.trim());
+            line = "";
+          }
+          line += str;
+          if (item.hasEOL) {
+            lines.push(line.trim());
+            line = "";
+            lastY = null;
+            return;
+          }
+          lastY = y;
+        });
+        if (line.trim()) lines.push(line.trim());
+        text += lines.filter(l => l.length > 0).join("\n") + "\n";
+      }
+      return sanitizeText(text);
+    }
+  } catch (e) {
+    if (e.message && e.message.indexOf("PDF reader") !== -1) throw e;
+    throw new Error("Could not read " + (file.name || "the file") + ". Try a different export (e.g. save as .docx).");
+  }
+  throw new Error("Unsupported file type. Use .docx, .pdf, or .md");
+}
+
+// ─── DOCUMENT EXPORT ────────────────────────────────────────────────────────
+// Programmatic downloads are blocked in the artifact sandbox, so exports build a
+// blob and hand back an object URL the user clicks. Libraries load from CDN.
+function loadScript(src) {
+  return new Promise((resolve, reject) => {
+    if (document.querySelector('script[src="' + src + '"]')) return resolve();
+    const s = document.createElement("script");
+    s.src = src;
+    s.onload = () => resolve();
+    s.onerror = () => reject(new Error("Could not load export library"));
+    document.head.appendChild(s);
+  });
+}
+
+// Classify each line so exports can reproduce document structure rather than
+// flattening everything into identical body paragraphs.
+function parseDocumentBlocks(text) {
+  const lines = (text || "").split(/\r?\n/);
+  const raw = [];
+  lines.forEach((l, idx) => {
+    const line = l.trim();
+    if (!line) { raw.push({ type: "blank" }); return; }
+    // Bullets: •, -, *, or a middot.
+    const bulletMatch = line.match(/^[\u2022\u00B7\-\*]\s*(.+)$/);
+    if (bulletMatch) {
+      raw.push({ type: "bullet", text: bulletMatch[1].trim() });
+      return;
+    }
+    // Section headings: short, all caps (allowing punctuation and digits).
+    const letters = line.replace(/[^A-Za-z]/g, "");
+    const isUpper = letters.length > 0 && letters === letters.toUpperCase();
+    if (isUpper && line.length <= 60) {
+      raw.push({ type: "heading", text: line });
+      return;
+    }
+    // Lines with pipes are typically contact info or company/location/date rows.
+    if (/\|/.test(line) && line.length <= 140) {
+      raw.push({ type: "subheading", text: line });
+      return;
+    }
+    raw.push({ type: "body", text: line, idx });
+  });
+
+  // The first non-blank line is the document owner's name.
+  const firstBody = raw.find(b => b.type !== "blank");
+  if (firstBody && firstBody.type === "body") firstBody.type = "name";
+
+  // A body line immediately followed by a pipe-delimited line is a job title.
+  for (let i = 0; i < raw.length - 1; i++) {
+    if (raw[i].type === "body" && raw[i + 1].type === "subheading") {
+      raw[i].type = "jobtitle";
+    }
+  }
+
+  // Collapse consecutive blanks.
+  const out = [];
+  raw.forEach(b => {
+    if (b.type === "blank" && out.length && out[out.length - 1].type === "blank") return;
+    out.push(b);
+  });
+  return out;
+}
+
+async function buildDocxBlob(title, text) {
+  await loadScript("https://cdn.jsdelivr.net/npm/docx@8.5.0/build/index.umd.js");
+  const docx = window.docx;
+  const blocks = parseDocumentBlocks(text);
+  const children = [];
+
+  blocks.forEach(b => {
+    if (b.type === "blank") {
+      children.push(new docx.Paragraph({ children: [], spacing: { after: 80 } }));
+      return;
+    }
+    if (b.type === "name") {
+      children.push(new docx.Paragraph({
+        children: [new docx.TextRun({ text: b.text, bold: true, size: 32, color: "0D274D" })],
+        spacing: { after: 60 },
+      }));
+      return;
+    }
+    if (b.type === "heading") {
+      children.push(new docx.Paragraph({
+        children: [new docx.TextRun({ text: b.text, bold: true, size: 24, color: "0D274D" })],
+        spacing: { before: 240, after: 120 },
+        border: { bottom: { color: "CCCCCC", size: 6, style: docx.BorderStyle.SINGLE, space: 4 } },
+      }));
+      return;
+    }
+    if (b.type === "jobtitle") {
+      children.push(new docx.Paragraph({
+        children: [new docx.TextRun({ text: b.text, bold: true, size: 22 })],
+        spacing: { before: 140, after: 20 },
+      }));
+      return;
+    }
+    if (b.type === "subheading") {
+      children.push(new docx.Paragraph({
+        children: [new docx.TextRun({ text: b.text, size: 20, color: "555555" })],
+        spacing: { after: 80 },
+      }));
+      return;
+    }
+    if (b.type === "bullet") {
+      children.push(new docx.Paragraph({
+        children: [new docx.TextRun({ text: b.text, size: 20 })],
+        bullet: { level: 0 },
+        spacing: { after: 60 },
+      }));
+      return;
+    }
+    children.push(new docx.Paragraph({
+      children: [new docx.TextRun({ text: b.text, size: 20 })],
+      spacing: { after: 80 },
+    }));
+  });
+
+  const doc = new docx.Document({
+    styles: { default: { document: { run: { font: "Calibri" } } } },
+    sections: [{
+      properties: { page: { margin: { top: 720, bottom: 720, left: 720, right: 720 } } },
+      children,
+    }],
+  });
+  return await docx.Packer.toBlob(doc);
+}
+
+async function buildPdfBlob(title, text) {
+  await loadScript("https://cdn.jsdelivr.net/npm/jspdf@2.5.1/dist/jspdf.umd.min.js");
+  const jsPDF = window.jspdf.jsPDF;
+  const doc = new jsPDF({ unit: "pt", format: "letter" });
+  const blocks = parseDocumentBlocks(text);
+
+  const marginX = 54;
+  const marginTop = 54;
+  const pageW = doc.internal.pageSize.getWidth();
+  const pageH = doc.internal.pageSize.getHeight();
+  const maxWidth = pageW - marginX * 2;
+  let y = marginTop;
+
+  const ensureRoom = (needed) => {
+    if (y + needed > pageH - 48) { doc.addPage(); y = marginTop; }
+  };
+
+  blocks.forEach(b => {
+    if (b.type === "blank") { y += 6; return; }
+
+    if (b.type === "name") {
+      ensureRoom(30);
+      doc.setFont("helvetica", "bold");
+      doc.setFontSize(16);
+      doc.setTextColor(13, 39, 77);
+      doc.text(b.text, marginX, y);
+      y += 20;
+      doc.setTextColor(0, 0, 0);
+      return;
+    }
+
+    if (b.type === "heading") {
+      ensureRoom(30);
+      y += 10;
+      doc.setFont("helvetica", "bold");
+      doc.setFontSize(11.5);
+      doc.setTextColor(13, 39, 77);
+      doc.text(b.text.toUpperCase(), marginX, y);
+      y += 5;
+      doc.setDrawColor(200, 200, 200);
+      doc.setLineWidth(0.7);
+      doc.line(marginX, y, pageW - marginX, y);
+      y += 12;
+      doc.setTextColor(0, 0, 0);
+      return;
+    }
+
+    if (b.type === "jobtitle") {
+      ensureRoom(20);
+      y += 4;
+      doc.setFont("helvetica", "bold");
+      doc.setFontSize(10.5);
+      const lines = doc.splitTextToSize(b.text, maxWidth);
+      lines.forEach(l => { ensureRoom(14); doc.text(l, marginX, y); y += 13; });
+      return;
+    }
+
+    if (b.type === "subheading") {
+      ensureRoom(18);
+      doc.setFont("helvetica", "normal");
+      doc.setFontSize(9);
+      doc.setTextColor(90, 90, 90);
+      const lines = doc.splitTextToSize(b.text, maxWidth);
+      lines.forEach(l => { ensureRoom(13); doc.text(l, marginX, y); y += 12; });
+      doc.setTextColor(0, 0, 0);
+      y += 3;
+      return;
+    }
+
+    if (b.type === "bullet") {
+      doc.setFont("helvetica", "normal");
+      doc.setFontSize(9.5);
+      const indent = 14;
+      const lines = doc.splitTextToSize(b.text, maxWidth - indent);
+      lines.forEach((l, i) => {
+        ensureRoom(13);
+        if (i === 0) doc.text("\u2022", marginX, y);
+        doc.text(l, marginX + indent, y);
+        y += 12;
+      });
+      y += 3;
+      return;
+    }
+
+    doc.setFont("helvetica", "normal");
+    doc.setFontSize(9.5);
+    const lines = doc.splitTextToSize(b.text, maxWidth);
+    lines.forEach(l => { ensureRoom(13); doc.text(l, marginX, y); y += 12; });
+    y += 4;
+  });
+
+  return doc.output("blob");
+}
+
+// Export modal state helper — returns {url, filename} for the download link.
+async function makeExport(format, title, text) {
+  const base = title.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
+  if (format === "docx") {
+    const blob = await buildDocxBlob(title, text);
+    return { url: URL.createObjectURL(blob), filename: base + ".docx" };
+  }
+  const blob = await buildPdfBlob(title, text);
+  return { url: URL.createObjectURL(blob), filename: base + ".pdf" };
+}
+
+// Strip control chars and lone surrogate code points that break the fetch body.
+// Rebuilds the string code unit by code unit so no unpaired surrogate can survive,
+// then forces a UTF-8 round trip so anything still unencodable becomes a plain
+// replacement character rather than breaking the request.
+function sanitizeText(s) {
+  if (!s) return "";
+  let out = "";
+  for (let i = 0; i < s.length; i++) {
+    const code = s.charCodeAt(i);
+    // High surrogate: keep only if followed by a valid low surrogate.
+    if (code >= 0xD800 && code <= 0xDBFF) {
+      const next = s.charCodeAt(i + 1);
+      if (next >= 0xDC00 && next <= 0xDFFF) {
+        out += s[i] + s[i + 1];
+        i++;
+      }
+      continue;
+    }
+    // Lone low surrogate: skip.
+    if (code >= 0xDC00 && code <= 0xDFFF) continue;
+    // Control chars (keep tab, newline, carriage return).
+    if (code < 0x20 && code !== 0x09 && code !== 0x0A && code !== 0x0D) {
+      out += " ";
+      continue;
+    }
+    if (code === 0x7F) { out += " "; continue; }
+    // Replacement char and non-characters.
+    if (code === 0xFFFD || code === 0xFFFE || code === 0xFFFF) continue;
+    out += s[i];
+  }
+  // UTF-8 round trip: guarantees the result is encodable by fetch.
+  try {
+    if (typeof TextEncoder !== "undefined" && typeof TextDecoder !== "undefined") {
+      const bytes = new TextEncoder().encode(out);
+      out = new TextDecoder("utf-8").decode(bytes);
+      // Drop any replacement chars the round trip introduced.
+      out = out.split("\uFFFD").join("");
+    }
+  } catch (e) { /* fall through with the manually cleaned string */ }
+  return out.trim();
+}
+
+// Pull a JSON object out of a model response that may include prose or fences.
+function parseModelJson(rawText) {
+  let s = (rawText || "").trim();
+  if (!s) return null;
+  // Strip code fences.
+  s = s.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/, "");
+  // If there's leading or trailing prose, take the outermost object.
+  const first = s.indexOf("{");
+  const last = s.lastIndexOf("}");
+  if (first !== -1 && last !== -1 && last > first) {
+    s = s.slice(first, last + 1);
+  }
+
+  const attempts = [
+    s,
+    // Remove trailing commas.
+    s.replace(/,(\s*[}\]])/g, "$1"),
+    // Escape literal newlines/tabs that appear inside the JSON (models often
+    // emit raw line breaks inside string values, which is invalid JSON).
+    escapeControlCharsInJson(s),
+    escapeControlCharsInJson(s).replace(/,(\s*[}\]])/g, "$1"),
+  ];
+  for (const attempt of attempts) {
+    try {
+      const parsed = JSON.parse(attempt);
+      if (parsed && typeof parsed === "object") return parsed;
+    } catch (e) { /* try next */ }
+  }
+
+  // Last resort: the response was truncated mid-output. Salvage what parsed.
+  const salvaged = salvageTruncatedJson(escapeControlCharsInJson(s));
+  if (salvaged) return salvaged;
+
+  return null;
+}
+
+// Recovers usable data from JSON that was cut off before the closing brace,
+// e.g. a truncated array of suggestions. Closes open strings/brackets and drops
+// the trailing incomplete element.
+function salvageTruncatedJson(s) {
+  // Try progressively shorter prefixes ending at a completed object or value,
+  // then close the structure.
+  const arrKey = s.match(/"(\w+)"\s*:\s*\[/);
+  if (arrKey) {
+    // Keep everything up to the last complete "}" inside the array.
+    const lastObj = s.lastIndexOf("}");
+    if (lastObj !== -1) {
+      const head = s.slice(0, lastObj + 1) + "]}";
+      try {
+        const parsed = JSON.parse(escapeControlCharsInJson(head));
+        if (parsed && typeof parsed === "object") return parsed;
+      } catch (e) { /* fall through */ }
+    }
+  }
+  // Try closing a single truncated object at the last complete key/value.
+  const lastComma = s.lastIndexOf(",");
+  if (lastComma !== -1) {
+    const head = s.slice(0, lastComma) + "}";
+    try {
+      const parsed = JSON.parse(escapeControlCharsInJson(head));
+      if (parsed && typeof parsed === "object") return parsed;
+    } catch (e) { /* fall through */ }
+  }
+  return null;
+}
+
+// Escapes raw control characters (newlines, tabs, carriage returns) that fall
+// inside JSON string literals, which models frequently emit unescaped.
+function escapeControlCharsInJson(s) {
+  let out = "";
+  let inString = false;
+  let prev = "";
+  for (let i = 0; i < s.length; i++) {
+    const ch = s[i];
+    if (ch === '"' && prev !== "\\") inString = !inString;
+    if (inString) {
+      if (ch === "\n") { out += "\\n"; prev = ch; continue; }
+      if (ch === "\r") { out += "\\r"; prev = ch; continue; }
+      if (ch === "\t") { out += "\\t"; prev = ch; continue; }
+    }
+    out += ch;
+    prev = ch;
+  }
+  return out;
+}
+
+// ── Global call pacing ──────────────────────────────────────────────────────
+// The sandbox proxy silently returns an empty 200 when calls arrive too fast.
+// Every request therefore goes through a single queue: one call in flight at a
+// time, with a minimum gap between call starts. Retries use long backoffs so
+// they land outside the rate window instead of inside it.
+let _pacerQueue = Promise.resolve();
+let _lastCallEnd = 0;
+const MIN_CALL_GAP_MS = 2500;
+
+function paced(fn) {
+  const run = _pacerQueue.then(async () => {
+    const wait = Math.max(0, _lastCallEnd + MIN_CALL_GAP_MS - Date.now());
+    if (wait > 0) await new Promise(r => setTimeout(r, wait));
+    try {
+      return await fn();
+    } finally {
+      _lastCallEnd = Date.now();
+    }
+  });
+  _pacerQueue = run.catch(() => {});
+  return run;
+}
+
+// Single Claude call with retry. Long backoffs (5s, 12s, 25s) so retries land
+// outside the proxy's rate window rather than inside it.
+async function callClaude(prompt, signal, maxTokens) {
+  const backoffs = [5000, 12000, 25000];
+  let lastErr = null;
+
+  for (let attempt = 0; attempt <= backoffs.length; attempt++) {
+    if (attempt > 0) {
+      await new Promise(r => setTimeout(r, backoffs[attempt - 1]));
+    }
+    try {
+      return await paced(() => callClaudeOnce(prompt, signal, maxTokens));
+    } catch (e) {
+      if (e.name === "AbortError") throw e;
+      lastErr = e;
+      const msg = e.message || "";
+      const transient =
+        msg.indexOf("Empty body") !== -1 ||
+        msg.indexOf("no text") !== -1 ||
+        msg.indexOf("read response") !== -1 ||
+        msg.indexOf("429") !== -1 ||
+        msg.indexOf("529") !== -1 ||
+        msg.indexOf("500") !== -1 ||
+        msg.indexOf("502") !== -1 ||
+        msg.indexOf("503") !== -1;
+      if (!transient) throw e;
+    }
+  }
+  throw new Error(
+    (lastErr && lastErr.message ? lastErr.message : "Request failed") +
+    " (after " + (backoffs.length + 1) + " attempts with long backoff)"
+  );
+}
+
+// One attempt. Returns raw text. Throws readable errors.
+async function callClaudeOnce(prompt, signal, maxTokens) {
+  // Always sanitize, not just on failure — extraction output is never trusted.
+  const safePrompt = sanitizeText(prompt);
+
+  let body;
+  try {
+    body = JSON.stringify({ prompt: safePrompt, max_tokens: maxTokens || 4096 });
+  } catch (e) {
+    throw new Error("Could not prepare the request. The document may contain unusual characters.");
+  }
+
+  let response;
+  try {
+    response = await fetch("/api/ai", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body,
+      signal,
+    });
+  } catch (e) {
+    if (e.name === "AbortError") throw e;
+    throw new Error("Request failed: " + (e.message || "network error"));
+  }
+  if (!response.ok) {
+    const errBody = await response.text().catch(() => "");
+    throw new Error("API error " + response.status + ": " + errBody.slice(0, 300));
+  }
+  // Read as text first so a non-JSON body produces a readable message.
+  let raw;
+  try {
+    raw = await response.text();
+  } catch (textErr) {
+    throw new Error("Could not read response body: " + (textErr.message || String(textErr)));
+  }
+  if (!raw || !raw.trim()) {
+    // A 200 with a zero-length body is not normal API behaviour. Report the
+    // observable facts so the cause can be identified rather than guessed at.
+    let ct = "";
+    try { ct = response.headers.get("content-type") || "none"; } catch (e) { ct = "unreadable"; }
+    throw new Error(
+      "Empty body from API. status=" + response.status +
+      " type=" + response.type +
+      " content-type=" + ct +
+      " length=" + raw.length +
+      " promptChars=" + safePrompt.length
+    );
+  }
+  let data;
+  try {
+    data = JSON.parse(raw);
+  } catch (e) {
+    throw new Error("Unexpected API response: " + raw.slice(0, 200));
+  }
+  if (data.error) {
+    throw new Error("API error: " + (data.error.message || JSON.stringify(data.error).slice(0, 200)));
+  }
+  const text = (data.content || []).map(b => (b && b.text) ? b.text : "").join("");
+  if (!text.trim()) {
+    // The call succeeded but produced no text. stop_reason explains why.
+    const why = data.stop_reason ? " (stop_reason: " + data.stop_reason + ")" : "";
+    throw new Error("The model returned no text" + why + ". Try again.");
+  }
+  return text;
+}
+
+// ─── MARKET INTELLIGENCE (Production: computed live from Supabase) ───────────
+const MARKET_INTEL = {
+  uxr: {
+    label: "UX Research",
+    topMethods: [
+      { name: "Usability testing", pct: 72 },
+      { name: "User interviews", pct: 68 },
+      { name: "Surveys", pct: 54 },
+      { name: "A/B testing", pct: 41 },
+      { name: "Analytics / log analysis", pct: 35 },
+      { name: "Diary studies", pct: 28 },
+      { name: "Ethnography", pct: 22 },
+      { name: "Benchmarking", pct: 19 },
+    ],
+    topSoftSkills: [
+      { name: "Collaborative", pct: 78 },
+      { name: "Communication", pct: 74 },
+      { name: "Strategic thinking", pct: 52 },
+      { name: "Analytical", pct: 48 },
+      { name: "Influential", pct: 38 },
+      { name: "Curious", pct: 30 },
+    ],
+    aiMentionRate: 45,
+    salaryRanges: {
+      Intern: [40000, 60000], Entry: [65000, 95000], Mid: [90000, 140000],
+      Senior: [130000, 210000], Manager: [150000, 240000], Lead: [150000, 250000], Principal: [175000, 280000],
+      Director: [160000, 300000],
+    },
+    topResponsibilities: [
+      "Conduct end-to-end research studies",
+      "Present findings to stakeholders",
+      "Influence product strategy with insights",
+      "Develop actionable recommendations",
+      "Collaborate cross-functionally with design and engineering",
+    ],
+    emergingSignals: ["AI product research", "Agentic AI", "Research operations", "Research democratization", "AI-augmented workflows"],
+    degreeRate: 58,
+  },
+  design: {
+    label: "UX Design",
+    topMethods: [
+      { name: "Prototyping", pct: 74 },
+      { name: "Wireframing", pct: 62 },
+      { name: "Design systems", pct: 58 },
+      { name: "User flows", pct: 51 },
+      { name: "Interaction design", pct: 48 },
+      { name: "Visual design", pct: 44 },
+      { name: "Responsive design", pct: 39 },
+      { name: "Accessibility", pct: 32 },
+    ],
+    topSoftSkills: [
+      { name: "Collaborative", pct: 80 },
+      { name: "Communication", pct: 72 },
+      { name: "Creative problem-solving", pct: 55 },
+      { name: "Detail-oriented", pct: 48 },
+      { name: "Strategic thinking", pct: 40 },
+      { name: "Empathy", pct: 34 },
+    ],
+    aiMentionRate: 55,
+    salaryRanges: {
+      Intern: [38000, 55000], Entry: [60000, 90000], Mid: [85000, 135000],
+      Senior: [120000, 200000], Manager: [145000, 230000], Lead: [145000, 240000], Director: [155000, 290000],
+    },
+    topResponsibilities: [
+      "Own end-to-end design for product areas",
+      "Build and maintain design systems",
+      "Collaborate with engineering on implementation",
+      "Conduct design reviews and critiques",
+      "Mentor junior designers",
+    ],
+    emergingSignals: ["AI-native interaction patterns", "Prompt UX", "Generative design tools", "Conversational UI", "Multimodal interfaces"],
+    degreeRate: 48,
+  },
+  pm: {
+    label: "Product Management",
+    topMethods: [
+      { name: "Roadmap planning", pct: 72 },
+      { name: "Data analysis", pct: 68 },
+      { name: "Stakeholder management", pct: 65 },
+      { name: "Agile / Scrum", pct: 60 },
+      { name: "A/B testing", pct: 55 },
+      { name: "User story writing", pct: 44 },
+      { name: "Competitive analysis", pct: 38 },
+      { name: "OKR management", pct: 32 },
+    ],
+    topSoftSkills: [
+      { name: "Strategic thinking", pct: 76 },
+      { name: "Communication", pct: 74 },
+      { name: "Collaborative", pct: 72 },
+      { name: "Analytical", pct: 68 },
+      { name: "Leadership", pct: 56 },
+      { name: "Decisive", pct: 34 },
+    ],
+    aiMentionRate: 60,
+    salaryRanges: {
+      Entry: [70000, 100000], Mid: [100000, 155000],
+      Senior: [140000, 220000], Manager: [160000, 250000], Lead: [160000, 260000],
+      Director: [180000, 320000],
+    },
+    topResponsibilities: [
+      "Define product strategy and vision",
+      "Manage product roadmap and priorities",
+      "Drive cross-functional alignment",
+      "Analyze product metrics and KPIs",
+      "Lead go-to-market execution",
+    ],
+    emergingSignals: ["AI product strategy", "Agentic product design", "LLM-powered features", "AI safety considerations", "Model evaluation"],
+    degreeRate: 52,
+  },
+};
+
+// ─── LOCATION & SENIORITY NORMS (illustrative — production pulls these live
+// from Meridian's location-tagged Supabase records) ──────────────────────────
+// Multiplier applied to the base salary range before comparing to a posting.
+const LOCATION_TIERS = {
+  major_metro: { label: "Major tech hub (SF, NYC, Seattle, etc.)", multiplier: 1.28 },
+  mid_metro: { label: "Mid-size metro", multiplier: 1.0 },
+  remote: { label: "Remote", multiplier: 0.96 },
+  lower_cost: { label: "Lower cost-of-living region", multiplier: 0.85 },
+};
+
+// Typical years of experience a posting at each level tends to ask for. Used
+// to flag when a posting's stated requirement runs unusually high or low for
+// its own title.
+const TYPICAL_YEARS_BY_SENIORITY = {
+  Intern: [0, 1], Entry: [0, 2], Mid: [2, 5], Senior: [5, 9],
+  Lead: [7, 12], Staff: [8, 14], Principal: [10, 16],
+  Manager: [5, 10], Director: [10, 18], VP: [14, 24], Head: [12, 20],
+};
+
+// A typical posting lists this many concrete methods/tools as requirements.
+// Far more than this signals an unusually demanding or poorly scoped posting.
+const TYPICAL_METHOD_COUNT_RANGE = [2, 6];
+
+// ─── THEME TOKENS (Ledger pattern: light default, dark available) ───────────
+const LIGHT_TOKENS = {
+  bg: "#F4F5F6",
+  bgCard: "#FFFFFF",
+  bgInput: "#EBEBEB",
+  bgSubtle: "rgba(0,0,0,0.02)",
+  bgHover: "#EBEBEB",
+  text: "#606162",
+  textSecondary: "#606162",
+  textMuted: "#8E8E8E",
+  textDim: "#B3B3B3",
+  textBright: "#1B1C1D",
+  border: "#EBEBEB",
+  borderStrong: "#D6D6D6",
+  accent: "#00BCEB",
+  accentInk: "#0070D2",
+  accentSoft: "rgba(0,188,235,0.10)",
+  midnight: "#0D274D",
+  success: "#399E20",
+  danger: "#E3241B",
+  warning: "#FBAB2C",
+  shadow: "0 1px 2px rgba(0,0,0,0.04), 0 3px 12px rgba(0,0,0,0.06)",
+  shadowHover: "0 2px 6px rgba(0,0,0,0.06), 0 8px 24px rgba(0,0,0,0.08)",
+  font: "'Inter', system-ui, Arial, sans-serif",
+  mono: "ui-monospace, 'SF Mono', 'Cascadia Code', monospace",
+};
+
+const DARK_TOKENS = {
+  bg: "#080B12",
+  bgCard: "#101724",
+  bgInput: "#1A2333",
+  bgSubtle: "rgba(255,255,255,0.03)",
+  bgHover: "#1E293B",
+  text: "#AAB6C6",
+  textSecondary: "#AAB6C6",
+  textMuted: "#7C8798",
+  textDim: "#525E6E",
+  textBright: "#F2F6FC",
+  border: "rgba(255,255,255,0.09)",
+  borderStrong: "#2C3A4E",
+  accent: "#12B8E6",
+  accentInk: "#38C6EE",
+  accentSoft: "rgba(18,184,230,0.16)",
+  midnight: "#0D274D",
+  success: "#43B12A",
+  danger: "#EF4438",
+  warning: "#FBAB2C",
+  shadow: "0 1px 2px rgba(0,0,0,0.4), 0 3px 14px rgba(0,0,0,0.5)",
+  shadowHover: "0 2px 8px rgba(0,0,0,0.5), 0 10px 30px rgba(0,0,0,0.6)",
+  font: "'Inter', system-ui, Arial, sans-serif",
+  mono: "ui-monospace, 'SF Mono', 'Cascadia Code', monospace",
+};
+
+// ─── DISCIPLINE DETECTION ───────────────────────────────────────────────────
+function detectDiscipline(text) {
+  const lower = (text || "").toLowerCase();
+  const scores = { uxr: 0, design: 0, pm: 0 };
+  ["ux research", "user research", "usability", "user experience research", "design research",
+   "qualitative research", "quantitative research", "user interview", "diary stud", "ethnograph",
+   "research plan", "research finding", "ux researcher", "user researcher"].forEach(s => {
+    if (lower.includes(s)) scores.uxr += 2;
+  });
+  ["ux design", "interaction design", "visual design", "ui design", "product design",
+   "design system", "figma", "sketch", "prototyp", "wireframe", "user interface",
+   "ux designer", "product designer", "ui/ux"].forEach(s => {
+    if (lower.includes(s)) scores.design += 2;
+  });
+  ["product manag", "product owner", "roadmap", "go-to-market", "gtm", "product strategy",
+   "backlog", "sprint", "agile", "scrum", "product metric", "okr", "kpi",
+   "product lifecycle", "feature priorit"].forEach(s => {
+    if (lower.includes(s)) scores.pm += 2;
+  });
+  const max = Math.max(scores.uxr, scores.design, scores.pm);
+  if (max === 0) return "uxr";
+  if (scores.uxr === max) return "uxr";
+  if (scores.design === max) return "design";
+  return "pm";
+}
+
+function detectSeniority(text) {
+  const lower = (text || "").toLowerCase();
+  if (/\b(vp|vice president)\b/.test(lower)) return "VP";
+  if (/\bdirector\b/.test(lower)) return "Director";
+  if (/\bprincipal\b/.test(lower)) return "Principal";
+  if (/\bstaff\b/.test(lower)) return "Staff";
+  if (/\bmanager\b/.test(lower)) return "Manager";
+  if (/\blead\b/.test(lower)) return "Lead";
+  if (/\bsenior\b/.test(lower)) return "Senior";
+  if (/\b(junior|entry|associate)\b/.test(lower)) return "Entry";
+  if (/\bintern\b/.test(lower)) return "Intern";
+  return "Mid";
+}
+
+// ─── SHARED COMPONENTS ─────────────────────────────────────────────────────
+
+function Card({ children, style, T }) {
+  return (
+    <div style={{
+      background: T.bgCard, border: "1px solid " + T.border,
+      borderRadius: 10, padding: "20px 24px", boxShadow: T.shadow, ...style,
+    }}>
+      {children}
+    </div>
+  );
+}
+
+function SectionLabel({ children, T }) {
+  return (
+    <div style={{
+      fontSize: 11, fontWeight: 600, color: T.textMuted,
+      textTransform: "uppercase", letterSpacing: "0.06em", marginBottom: 8,
+    }}>
+      {children}
+    </div>
+  );
+}
+
+function TextArea({ value, onChange, placeholder, rows, T }) {
+  const [focused, setFocused] = useState(false);
+  return (
+    <textarea
+      value={value}
+      onChange={e => onChange(e.target.value)}
+      placeholder={placeholder}
+      rows={rows || 8}
+      style={{
+        width: "100%", boxSizing: "border-box",
+        background: T.bgInput, color: T.textBright,
+        border: "1px solid " + (focused ? T.accent : T.borderStrong),
+        borderRadius: 8, padding: "12px 14px", fontSize: 13, lineHeight: 1.6,
+        fontFamily: T.font, resize: "vertical", outline: "none",
+        transition: "border-color 0.15s",
+      }}
+      onFocus={() => setFocused(true)}
+      onBlur={() => setFocused(false)}
+    />
+  );
+}
+
+function Btn({ children, onClick, disabled, primary, style: s, T }) {
+  const [hov, setHov] = useState(false);
+  return (
+    <button
+      onClick={onClick}
+      disabled={disabled}
+      onMouseEnter={() => setHov(true)}
+      onMouseLeave={() => setHov(false)}
+      style={{
+        padding: primary ? "11px 28px" : "6px 14px",
+        fontSize: primary ? 14 : 12,
+        fontWeight: 600,
+        fontFamily: T.font,
+        border: primary ? "none" : "1px solid " + T.border,
+        borderRadius: 7,
+        cursor: disabled ? "not-allowed" : "pointer",
+        transition: "all 0.15s",
+        background: primary
+          ? disabled ? T.borderStrong : hov ? T.accentInk : T.accent
+          : hov ? T.bgHover : "transparent",
+        color: primary ? "#fff" : T.textBright,
+        opacity: disabled ? 0.45 : 1,
+        letterSpacing: "-0.01em",
+        ...s,
+      }}
+    >
+      {children}
+    </button>
+  );
+}
+
+function TabBar({ tabs, active, onChange, T }) {
+  return (
+    <div style={{ display: "flex", gap: 0, borderBottom: "1px solid " + T.border, marginBottom: 20 }}>
+      {tabs.map(tab => (
+        <button
+          key={tab.id}
+          onClick={() => onChange(tab.id)}
+          style={{
+            padding: "10px 18px", fontSize: 13, fontWeight: active === tab.id ? 600 : 400,
+            fontFamily: T.font,
+            color: active === tab.id ? T.accentInk : T.textMuted,
+            background: "transparent", border: "none", cursor: "pointer",
+            borderBottom: active === tab.id ? "2px solid " + T.accent : "2px solid transparent",
+            transition: "all 0.15s", marginBottom: -1,
+          }}
+        >
+          {tab.label}
+        </button>
+      ))}
+    </div>
+  );
+}
+
+function BarStat({ label, pct, highlight, T }) {
+  return (
+    <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 7 }}>
+      <div style={{
+        width: 145, fontSize: 12, flexShrink: 0, fontWeight: highlight ? 600 : 400,
+        color: highlight ? T.accentInk : T.text,
+      }}>
+        {label}
+      </div>
+      <div style={{ flex: 1, height: 6, background: T.bgInput, borderRadius: 3, overflow: "hidden" }}>
+        <div style={{
+          width: pct + "%", height: "100%", borderRadius: 3,
+          background: highlight ? T.accent : T.textDim,
+          transition: "width 0.5s ease",
+        }} />
+      </div>
+      <div style={{ width: 32, fontSize: 11, textAlign: "right", fontWeight: 500, color: highlight ? T.accentInk : T.textMuted }}>
+        {pct}%
+      </div>
+    </div>
+  );
+}
+
+function CopyBtn({ text, T }) {
+  const [copied, setCopied] = useState(false);
+  return (
+    <Btn onClick={() => {
+      navigator.clipboard.writeText(text).then(() => {
+        setCopied(true);
+        setTimeout(() => setCopied(false), 2000);
+      }).catch(() => {});
+    }} T={T} style={{ fontSize: 11, padding: "5px 12px" }}>
+      {copied ? "\u2713 Copied" : "Copy to clipboard"}
+    </Btn>
+  );
+}
+
+// ─── LOADING ────────────────────────────────────────────────────────────────
+function LoadingView({ discipline, T }) {
+  const [idx, setIdx] = useState(0);
+  const msgs = [
+    "Reading job requirements",
+    "Cross-referencing market data",
+    "Analyzing " + (MARKET_INTEL[discipline]?.label || "market") + " landscape",
+    "Identifying positioning angles",
+    "Drafting tailored content",
+  ];
+  useEffect(() => {
+    const t = setInterval(() => setIdx(i => (i + 1) % msgs.length), 2800);
+    return () => clearInterval(t);
+  }, []);
+  return (
+    <div style={{ textAlign: "center", padding: "80px 20px" }}>
+      <div style={{ marginBottom: 28 }}>
+        {[0, 1, 2].map(i => (
+          <span key={i} style={{
+            display: "inline-block", width: 8, height: 8, borderRadius: "50%",
+            background: T.accent, margin: "0 4px", opacity: 0.3,
+            animation: "tailorPulse 1.4s ease-in-out " + (i * 0.2) + "s infinite",
+          }} />
+        ))}
+      </div>
+      <div style={{ fontSize: 15, color: T.textBright, fontWeight: 500, marginBottom: 6 }}>
+        Analyzing your application
+      </div>
+      <div style={{ fontSize: 13, color: T.textMuted }}>{msgs[idx]}</div>
+      <style>{"@keyframes tailorPulse { 0%, 80%, 100% { opacity: 0.3; transform: scale(1); } 40% { opacity: 1; transform: scale(1.3); } }"}</style>
+    </div>
+  );
+}
+
+// ─── EXPORT BUTTONS ─────────────────────────────────────────────────────────
+function ExportButtons({ title, text, T }) {
+  const [busy, setBusy] = useState(null); // "docx" | "pdf" | null
+  const [dl, setDl] = useState(null); // { url, filename }
+  const [err, setErr] = useState(null);
+
+  const run = async (format) => {
+    setErr(null);
+    setBusy(format);
+    setDl(null);
+    try {
+      const result = await makeExport(format, title, text);
+      setDl(result);
+    } catch (e) {
+      setErr("Export failed. Try again.");
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  return (
+    <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
+      <Btn onClick={() => run("docx")} disabled={busy !== null} T={T} style={{ fontSize: 11, padding: "5px 12px" }}>
+        {busy === "docx" ? "Building..." : "Export .docx"}
+      </Btn>
+      <Btn onClick={() => run("pdf")} disabled={busy !== null} T={T} style={{ fontSize: 11, padding: "5px 12px" }}>
+        {busy === "pdf" ? "Building..." : "Export .pdf"}
+      </Btn>
+      {dl && (
+        <a
+          href={dl.url}
+          download={dl.filename}
+          style={{
+            fontSize: 12, fontWeight: 600, color: T.accentInk,
+            textDecoration: "none", padding: "5px 12px",
+            border: "1px solid " + T.accent + "44", borderRadius: 7,
+            background: T.accentSoft,
+          }}
+        >
+          {"\u2193"} Download {dl.filename}
+        </a>
+      )}
+      {err && <span style={{ fontSize: 12, color: T.danger }}>{err}</span>}
+    </div>
+  );
+}
+
+// ─── RESULT TABS ────────────────────────────────────────────────────────────
+function CoverLetterTab({ coverLetter, onRegenerate, regenerating, T }) {
+  const [editRequest, setEditRequest] = useState("");
+  if (!coverLetter) return <div style={{ color: T.textMuted, fontSize: 13 }}>No cover letter generated.</div>;
+
+  return (
+    <div>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 14, gap: 12, flexWrap: "wrap" }}>
+        <SectionLabel T={T}>Generated cover letter</SectionLabel>
+        <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
+          <CopyBtn text={coverLetter} T={T} />
+          <ExportButtons title="Cover Letter" text={coverLetter} T={T} />
+        </div>
+      </div>
+
+      <Card T={T} style={{ background: T.bg, marginBottom: 20 }}>
+        <div style={{ fontSize: 13, lineHeight: 1.75, color: T.textBright, whiteSpace: "pre-wrap" }}>
+          {coverLetter}
+        </div>
+      </Card>
+
+      {/* Edit request + regenerate */}
+      <SectionLabel T={T}>Request edits</SectionLabel>
+      <TextArea
+        value={editRequest}
+        onChange={setEditRequest}
+        T={T}
+        rows={3}
+        placeholder={"Describe what to change. For example: make it shorter, more confident, emphasize my leadership experience, or adjust the opening line."}
+      />
+      <div style={{ marginTop: 12 }}>
+        <Btn
+          primary
+          disabled={regenerating || !editRequest.trim()}
+          onClick={() => onRegenerate(editRequest, () => setEditRequest(""))}
+          T={T}
+        >
+          {regenerating ? "Regenerating..." : "Regenerate cover letter"}
+        </Btn>
+      </div>
+    </div>
+  );
+}
+
+function ResumeTab({ suggestions, talkingPoints, resumeText, onReword, rewordingIdx, atsResult, T }) {
+  const [checked, setChecked] = useState({});
+  const [rewordInputs, setRewordInputs] = useState({});
+  const [builtResume, setBuiltResume] = useState("");
+  const [showBuilt, setShowBuilt] = useState(false);
+
+  const toggle = (i) => setChecked(c => ({ ...c, [i]: !c[i] }));
+  const setReword = (i, v) => setRewordInputs(r => ({ ...r, [i]: v }));
+
+  const anyChecked = Object.values(checked).some(Boolean);
+
+  const addToResume = () => {
+    const selected = (suggestions || []).filter((_, i) => checked[i]);
+    let out = (resumeText || "").trim();
+    // Use the document's own conventions (ALL-CAPS heading, bullet lines) so the
+    // additions export with the same structure as the rest of the resume.
+    out += "\n\nSUGGESTED ADDITIONS\n";
+    selected.forEach(s => {
+      out += "\n" + (s.location || s.area) + "\n";
+      out += "\u2022 " + (s.wording || s.suggestion) + "\n";
+    });
+    setBuiltResume(out.trim());
+    setShowBuilt(true);
+  };
+
+  return (
+    <div>
+      {atsResult && (
+        <div style={{ marginBottom: 24 }}>
+          <SectionLabel T={T}>ATS readiness</SectionLabel>
+          <AtsReport result={atsResult} T={T} compact />
+        </div>
+      )}
+
+      {suggestions && suggestions.length > 0 && (
+        <div style={{ marginBottom: 28 }}>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8, flexWrap: "wrap", gap: 8 }}>
+            <SectionLabel T={T}>Resume optimization suggestions</SectionLabel>
+            <span style={{ fontSize: 11, color: T.textDim }}>
+              Check the ones to apply, then add them to your resume below.
+            </span>
+          </div>
+
+          {suggestions.map((s, i) => (
+            <Card key={i} T={T} style={{ marginBottom: 10, borderColor: checked[i] ? T.accent + "44" : T.border }}>
+              <div style={{ display: "flex", gap: 12 }}>
+                {/* Checkbox */}
+                <button
+                  onClick={() => toggle(i)}
+                  style={{
+                    width: 20, height: 20, borderRadius: 5, flexShrink: 0, marginTop: 2,
+                    border: "2px solid " + (checked[i] ? T.accent : T.borderStrong),
+                    background: checked[i] ? T.accent : "transparent",
+                    color: "#fff", cursor: "pointer", fontSize: 12, fontWeight: 700,
+                    display: "flex", alignItems: "center", justifyContent: "center",
+                    padding: 0, fontFamily: T.font,
+                  }}
+                >
+                  {checked[i] ? "\u2713" : ""}
+                </button>
+
+                <div style={{ flex: 1, minWidth: 0 }}>
+                  <div style={{ fontSize: 13, fontWeight: 600, color: T.textBright, marginBottom: 4 }}>
+                    {s.area}
+                  </div>
+                  {s.gap && (
+                    <div style={{ fontSize: 12, color: T.warning, marginBottom: 6 }}>
+                      Gap: {s.gap}
+                    </div>
+                  )}
+                  <div style={{ fontSize: 12, color: T.text, lineHeight: 1.6, marginBottom: 10 }}>
+                    {s.suggestion}
+                  </div>
+
+                  {/* Suggested wording + where it goes */}
+                  {s.wording && (
+                    <div style={{
+                      background: T.bgInput, border: "1px solid " + T.border,
+                      borderRadius: 8, padding: "12px 14px", marginBottom: 10,
+                    }}>
+                      {s.location && (
+                        <div style={{ fontSize: 10, color: T.accentInk, textTransform: "uppercase", letterSpacing: "0.06em", fontWeight: 600, marginBottom: 6 }}>
+                          Where it goes: {s.location}
+                        </div>
+                      )}
+                      <div style={{ fontSize: 13, color: T.textBright, lineHeight: 1.6, whiteSpace: "pre-wrap" }}>
+                        {s.wording}
+                      </div>
+                    </div>
+                  )}
+
+                  {/* Per-suggestion reword request */}
+                  <div style={{ display: "flex", gap: 8, alignItems: "flex-start" }}>
+                    <input
+                      type="text"
+                      value={rewordInputs[i] || ""}
+                      onChange={e => setReword(i, e.target.value)}
+                      placeholder="Suggest an edit or reword for this item"
+                      style={{
+                        flex: 1, boxSizing: "border-box",
+                        background: T.bgCard, color: T.textBright,
+                        border: "1px solid " + T.borderStrong, borderRadius: 7,
+                        padding: "7px 10px", fontSize: 12, fontFamily: T.font, outline: "none",
+                      }}
+                    />
+                    <button
+                      onClick={() => {
+                        if (!rewordInputs[i]?.trim()) return;
+                        onReword(i, rewordInputs[i], () => setReword(i, ""));
+                      }}
+                      disabled={rewordingIdx === i || !rewordInputs[i]?.trim()}
+                      style={{
+                        fontFamily: T.font, fontSize: 12, fontWeight: 600,
+                        border: "1px solid " + T.border, borderRadius: 7,
+                        padding: "7px 12px", cursor: rewordingIdx === i ? "wait" : "pointer",
+                        background: "transparent", color: T.textBright,
+                        opacity: rewordingIdx === i || !rewordInputs[i]?.trim() ? 0.45 : 1,
+                        whiteSpace: "nowrap",
+                      }}
+                    >
+                      {rewordingIdx === i ? "..." : "Reword"}
+                    </button>
+                  </div>
+                </div>
+              </div>
+            </Card>
+          ))}
+
+          {/* Global add-to-resume */}
+          <div style={{ marginTop: 16 }}>
+            <Btn primary onClick={addToResume} disabled={!anyChecked} T={T}>
+              Add selected to resume
+            </Btn>
+            {!anyChecked && (
+              <span style={{ fontSize: 12, color: T.textDim, marginLeft: 12 }}>
+                Check at least one suggestion
+              </span>
+            )}
+          </div>
+        </div>
+      )}
+
+      {/* Rebuilt, editable resume */}
+      {showBuilt && (
+        <div style={{ marginBottom: 28 }}>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8, flexWrap: "wrap", gap: 8 }}>
+            <SectionLabel T={T}>Your updated resume</SectionLabel>
+            <ExportButtons title="Resume" text={builtResume} T={T} />
+          </div>
+          <div style={{ fontSize: 12, color: T.textMuted, marginBottom: 10, lineHeight: 1.6 }}>
+            Edit anything below, then export. Suggested additions are grouped at the end so you can place them where they fit.
+          </div>
+          <TextArea value={builtResume} onChange={setBuiltResume} T={T} rows={20} />
+        </div>
+      )}
+
+      {talkingPoints && talkingPoints.length > 0 && (
+        <div>
+          <SectionLabel T={T}>Interview talking points</SectionLabel>
+          <Card T={T}>
+            {talkingPoints.map((tp, i) => (
+              <div key={i} style={{
+                padding: "8px 0",
+                borderBottom: i < talkingPoints.length - 1 ? "1px solid " + T.border : "none",
+                display: "flex", gap: 10, alignItems: "flex-start",
+              }}>
+                <span style={{ color: T.accent, fontSize: 12, marginTop: 2, flexShrink: 0 }}>{"\u2192"}</span>
+                <span style={{ fontSize: 13, color: T.textBright, lineHeight: 1.5 }}>{tp}</span>
+              </div>
+            ))}
+          </Card>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ─── JOB VS MARKET ──────────────────────────────────────────────────────────
+function VerdictBadge({ verdict, T, labels }) {
+  const map = {
+    below: { color: T.warning, text: labels?.below || "Below market" },
+    above: { color: T.accentInk, text: labels?.above || "Above market" },
+    competitive: { color: T.success, text: labels?.competitive || "Competitive" },
+    unlisted: { color: T.textMuted, text: labels?.unlisted || "Not listed" },
+    high: { color: T.warning, text: labels?.high || "Higher than typical" },
+    low: { color: T.accentInk, text: labels?.low || "Lower than typical" },
+    typical: { color: T.success, text: labels?.typical || "Typical" },
+    demanding: { color: T.warning, text: labels?.demanding || "Demanding" },
+    narrow: { color: T.textMuted, text: labels?.narrow || "Light on detail" },
+  };
+  const m = map[verdict] || { color: T.textMuted, text: verdict };
+  return (
+    <span style={{
+      display: "inline-block", padding: "3px 10px", borderRadius: 6,
+      fontSize: 11, fontWeight: 700, color: "#fff", background: m.color,
+      textTransform: "uppercase", letterSpacing: "0.03em",
+    }}>
+      {m.text}
+    </span>
+  );
+}
+
+function JobVsMarket({ jobDims, jobDimsLoading, jobDimsError, intel, jobTextLength, T }) {
+  if (jobTextLength < 150) {
+    return (
+      <div style={{ fontSize: 12, color: T.textDim, marginBottom: 20 }}>
+        Paste more of the job description (150+ characters) to compare it against the market.
+      </div>
+    );
+  }
+  if (jobDimsLoading && !jobDims) {
+    return (
+      <div style={{ fontSize: 12, color: T.textMuted, marginBottom: 20 }}>
+        Reading this posting's level, location, and requirements in the background...
+      </div>
+    );
+  }
+  if (jobDimsError && !jobDims) {
+    return (
+      <div style={{ fontSize: 12, color: T.textMuted, marginBottom: 20 }}>
+        Could not read this posting's structured details right now. The market frequency data below still applies.
+      </div>
+    );
+  }
+  if (!jobDims) return null;
+
+  const comparison = compareJobToMarket(jobDims, intel);
+  if (!comparison) return null;
+
+  const { salary, experience, breadth, tierLabel, seniority, seniorityNote } = comparison;
+
+  return (
+    <div style={{ marginBottom: 28 }}>
+      <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 4 }}>
+        <SectionLabel T={T}>This posting vs. the market</SectionLabel>
+        {jobDimsLoading && <span style={{ fontSize: 10, color: T.textDim }}>updating\u2026</span>}
+      </div>
+      <div style={{ fontSize: 12, color: T.textMuted, marginBottom: seniorityNote ? 4 : 14 }}>
+        Read as a <strong style={{ color: T.textSecondary }}>{seniority}</strong> {intel.label} posting,{" "}
+        <strong style={{ color: T.textSecondary }}>{tierLabel}</strong>.
+      </div>
+      {seniorityNote && (
+        <div style={{ fontSize: 11, color: T.textDim, marginBottom: 14, lineHeight: 1.5 }}>
+          {seniorityNote}
+        </div>
+      )}
+
+      {/* Salary */}
+      {salary && (
+        <Card T={T} style={{ marginBottom: 12 }}>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 12, marginBottom: 10, flexWrap: "wrap" }}>
+            <div style={{ fontSize: 13, fontWeight: 600, color: T.textBright }}>Salary</div>
+            <VerdictBadge verdict={salary.verdict} T={T} />
+          </div>
+          <div style={{ display: "flex", gap: 24, marginBottom: 10, flexWrap: "wrap" }}>
+            {salary.jobRange && (
+              <div>
+                <div style={{ fontSize: 10, color: T.textMuted, textTransform: "uppercase", letterSpacing: "0.06em", marginBottom: 3 }}>This posting</div>
+                <div style={{ fontSize: 17, fontWeight: 700, color: T.textBright }}>
+                  ${Math.round(salary.jobRange[0] / 1000)}K{salary.jobRange[1] !== salary.jobRange[0] ? "\u2013$" + Math.round(salary.jobRange[1] / 1000) + "K" : ""}
+                </div>
+              </div>
+            )}
+            <div>
+              <div style={{ fontSize: 10, color: T.textMuted, textTransform: "uppercase", letterSpacing: "0.06em", marginBottom: 3 }}>Market ({tierLabel.split(" ")[0]}{tierLabel.split(" ")[0] === "Major" ? " metro" : ""})</div>
+              <div style={{ fontSize: 17, fontWeight: 700, color: T.textSecondary }}>
+                ${Math.round(salary.marketRange[0] / 1000)}K{"\u2013"}${Math.round(salary.marketRange[1] / 1000)}K
+              </div>
+            </div>
+          </div>
+          <div style={{ fontSize: 12, color: T.text, lineHeight: 1.55 }}>{salary.detail}</div>
+        </Card>
+      )}
+
+      {/* Experience requirement */}
+      {experience && (
+        <Card T={T} style={{ marginBottom: 12 }}>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 12, marginBottom: 8, flexWrap: "wrap" }}>
+            <div style={{ fontSize: 13, fontWeight: 600, color: T.textBright }}>Experience requirement</div>
+            <VerdictBadge verdict={experience.verdict} T={T} />
+          </div>
+          <div style={{ fontSize: 12, color: T.text, lineHeight: 1.55 }}>{experience.detail}</div>
+        </Card>
+      )}
+
+      {/* Requirements breadth */}
+      {breadth && (
+        <Card T={T}>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 12, marginBottom: 8, flexWrap: "wrap" }}>
+            <div style={{ fontSize: 13, fontWeight: 600, color: T.textBright }}>Requirements breadth</div>
+            <VerdictBadge verdict={breadth.verdict} T={T} />
+          </div>
+          <div style={{ fontSize: 12, color: T.text, lineHeight: 1.55, marginBottom: 8 }}>{breadth.detail}</div>
+          {jobDims.required_methods && jobDims.required_methods.length > 0 && (
+            <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
+              {jobDims.required_methods.map((m, i) => (
+                <span key={i} style={{
+                  padding: "3px 9px", fontSize: 11, borderRadius: 5,
+                  background: T.bgInput, color: T.textSecondary, border: "1px solid " + T.borderStrong,
+                }}>
+                  {m}
+                </span>
+              ))}
+            </div>
+          )}
+        </Card>
+      )}
+    </div>
+  );
+}
+
+function MarketIntelTab({ discipline, seniority, jobText, jobDims, jobDimsLoading, jobDimsError, T }) {
+  const intel = MARKET_INTEL[discipline];
+  if (!intel) return null;
+  const jobLower = (jobText || "").toLowerCase();
+
+  const methodMatches = intel.topMethods.map(m => ({
+    ...m,
+    inJob: jobLower.includes(m.name.toLowerCase()) ||
+           m.name.toLowerCase().split(" / ").some(p => jobLower.includes(p.trim())),
+  }));
+  const skillMatches = intel.topSoftSkills.map(s => ({
+    ...s,
+    inJob: jobLower.includes(s.name.toLowerCase()) ||
+           s.name.toLowerCase().split(" / ").some(p => jobLower.includes(p.trim())),
+  }));
+  const salaryRange = intel.salaryRanges[seniority];
+
+  return (
+    <div>
+      <JobVsMarket
+        jobDims={jobDims}
+        jobDimsLoading={jobDimsLoading}
+        jobDimsError={jobDimsError}
+        intel={intel}
+        jobTextLength={(jobText || "").length}
+        T={T}
+      />
+
+      <div style={{ fontSize: 12, color: T.textMuted, marginBottom: 20, lineHeight: 1.6 }}>
+        Market intelligence from Meridian, based on active {intel.label} postings.
+        Highlighted items appear in this specific job description.
+      </div>
+
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 12, marginBottom: 24 }}>
+        {salaryRange && (
+          <Card T={T}>
+            <div style={{ fontSize: 10, color: T.textMuted, textTransform: "uppercase", letterSpacing: "0.06em", marginBottom: 6 }}>
+              {seniority} salary range
+            </div>
+            <div style={{ fontSize: 20, fontWeight: 700, color: T.textBright, letterSpacing: "-0.02em" }}>
+              ${(salaryRange[0] / 1000).toFixed(0)}K{"\u2013"}${(salaryRange[1] / 1000).toFixed(0)}K
+            </div>
+          </Card>
+        )}
+        <Card T={T}>
+          <div style={{ fontSize: 10, color: T.textMuted, textTransform: "uppercase", letterSpacing: "0.06em", marginBottom: 6 }}>
+            AI mention rate
+          </div>
+          <div style={{ fontSize: 20, fontWeight: 700, color: intel.aiMentionRate > 40 ? T.accentInk : T.textBright, letterSpacing: "-0.02em" }}>
+            {intel.aiMentionRate}%
+          </div>
+          <div style={{ fontSize: 10, color: T.textDim, marginTop: 2 }}>of postings</div>
+        </Card>
+        <Card T={T}>
+          <div style={{ fontSize: 10, color: T.textMuted, textTransform: "uppercase", letterSpacing: "0.06em", marginBottom: 6 }}>
+            Degree required
+          </div>
+          <div style={{ fontSize: 20, fontWeight: 700, color: T.textBright, letterSpacing: "-0.02em" }}>
+            {intel.degreeRate}%
+          </div>
+          <div style={{ fontSize: 10, color: T.textDim, marginTop: 2 }}>of postings</div>
+        </Card>
+      </div>
+
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 20, marginBottom: 24 }}>
+        <div>
+          <SectionLabel T={T}>Methods {"\u2014"} market frequency</SectionLabel>
+          <Card T={T} style={{ padding: "16px 18px" }}>
+            {methodMatches.sort((a, b) => b.pct - a.pct).map((m, i) => (
+              <BarStat key={i} label={m.name} pct={m.pct} highlight={m.inJob} T={T} />
+            ))}
+          </Card>
+        </div>
+        <div>
+          <SectionLabel T={T}>Soft skills {"\u2014"} market frequency</SectionLabel>
+          <Card T={T} style={{ padding: "16px 18px" }}>
+            {skillMatches.sort((a, b) => b.pct - a.pct).map((s, i) => (
+              <BarStat key={i} label={s.name} pct={s.pct} highlight={s.inJob} T={T} />
+            ))}
+          </Card>
+        </div>
+      </div>
+
+      <SectionLabel T={T}>Emerging market signals</SectionLabel>
+      <div style={{ display: "flex", flexWrap: "wrap", gap: 8 }}>
+        {intel.emergingSignals.map((sig, i) => {
+          const match = jobLower.includes(sig.toLowerCase());
+          return (
+            <span key={i} style={{
+              padding: "5px 12px", fontSize: 12, borderRadius: 6,
+              background: match ? T.accentSoft : T.bgInput,
+              color: match ? T.accentInk : T.textMuted,
+              border: "1px solid " + (match ? T.accent + "44" : T.borderStrong),
+              fontWeight: match ? 600 : 400,
+            }}>
+              {sig}
+            </span>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+// ─── ATS ASSESSMENT (deterministic — no AI) ─────────────────────────────────
+// Every check, weight, and score below is computed in JavaScript from the resume
+// text. Nothing here is model-generated.
+const ATS_SECTION_PATTERNS = [
+  { key: "experience", label: "Work experience", re: /\b(professional experience|work experience|experience|employment history)\b/i },
+  { key: "education", label: "Education", re: /\beducation\b/i },
+  { key: "skills", label: "Skills", re: /\b(skills|core competencies|technical skills|competencies)\b/i },
+  { key: "summary", label: "Summary", re: /\b(summary|professional summary|profile|objective)\b/i },
+];
+
+function assessATS(resumeText, opts) {
+  const text = resumeText || "";
+  const lines = text.split(/\r?\n/).map(l => l.trim());
+  const nonEmpty = lines.filter(Boolean);
+  const words = text.split(/\s+/).filter(Boolean);
+  const lower = text.toLowerCase();
+  const checks = [];
+
+  const add = (id, label, status, detail, fix, weight) => {
+    checks.push({ id, label, status, detail, fix: fix || null, weight: weight || 1 });
+  };
+
+  // 1. Contact details -------------------------------------------------------
+  const hasEmail = /[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i.test(text);
+  const hasPhone = /(\+?\d{1,2}[\s.-])?\(?\d{3}\)?[\s.-]?\d{3}[\s.-]?\d{4}/.test(text);
+  if (hasEmail && hasPhone) {
+    add("contact", "Contact details", "pass", "Email and phone number both found.", null, 2);
+  } else {
+    const missing = [!hasEmail && "email", !hasPhone && "phone number"].filter(Boolean).join(" and ");
+    add("contact", "Contact details", "fail",
+      "No " + missing + " detected in the text layer.",
+      "Add your " + missing + " as plain text near the top. If it is already there, it may be inside a header, text box, or image, which most parsers ignore.", 2);
+  }
+
+  // 2. Standard section headings --------------------------------------------
+  const foundSections = ATS_SECTION_PATTERNS.filter(s => s.re.test(text));
+  const missingSections = ATS_SECTION_PATTERNS.filter(s => !s.re.test(text));
+  if (missingSections.length === 0) {
+    add("sections", "Standard section headings", "pass", "All four expected sections found.", null, 2);
+  } else if (missingSections.length === 1) {
+    add("sections", "Standard section headings", "warn",
+      "Missing: " + missingSections.map(s => s.label).join(", ") + ".",
+      "Add a clearly labelled " + missingSections[0].label + " section. Parsers map content to fields using these exact headings.", 2);
+  } else {
+    add("sections", "Standard section headings", "fail",
+      "Missing: " + missingSections.map(s => s.label).join(", ") + ".",
+      "Use conventional headings (Professional Summary, Experience, Skills, Education). Creative labels like \u201CWhat I Bring\u201D are not recognised.", 2);
+  }
+
+  // 3. A dedicated skills section -------------------------------------------
+  const hasSkillsSection = /\b(skills|core competencies|technical skills)\b/i.test(text);
+  if (hasSkillsSection) {
+    add("skills_section", "Skills section", "pass", "A skills section is present for keyword matching.", null, 2);
+  } else {
+    add("skills_section", "Skills section", "fail",
+      "No skills section found.",
+      "Add a Skills section listing methods and tools as plain comma-separated text. This is the single highest-value block for keyword matching.", 2);
+  }
+
+  // 4. Bullets ---------------------------------------------------------------
+  const bulletLines = nonEmpty.filter(l => /^[\u2022\u00B7\-\*\u25AA\u25CF\u2023\u2043]/.test(l));
+  if (bulletLines.length >= 5) {
+    add("bullets", "Bulleted achievements", "pass", bulletLines.length + " bulleted lines found.", null, 1);
+  } else if (bulletLines.length > 0) {
+    add("bullets", "Bulleted achievements", "warn",
+      "Only " + bulletLines.length + " bulleted lines found.",
+      "Break dense paragraphs into bullets. Parsers and recruiters both scan bullets more reliably than prose blocks.", 1);
+  } else {
+    add("bullets", "Bulleted achievements", "fail",
+      "No bullet characters detected.",
+      "Use standard bullets for accomplishments. Avoid decorative glyphs or images as bullet markers.", 1);
+  }
+
+  // 5. Dates -----------------------------------------------------------------
+  const yearMatches = text.match(/\b(19|20)\d{2}\b/g) || [];
+  const rangeMatches = text.match(/\b(19|20)\d{2}\s*[\u2013\u2014-]\s*((19|20)\d{2}|present|current)\b/gi) || [];
+  if (rangeMatches.length >= 2) {
+    add("dates", "Employment dates", "pass", rangeMatches.length + " date ranges found in a parseable format.", null, 2);
+  } else if (yearMatches.length >= 2) {
+    add("dates", "Employment dates", "warn",
+      "Years appear, but few clear ranges were detected.",
+      "Write each role's dates as a range, for example 2022 \u2013 Present or Jan 2019 \u2013 Mar 2022. Parsers use these to compute tenure.", 2);
+  } else {
+    add("dates", "Employment dates", "fail",
+      "No employment date ranges detected.",
+      "Add start and end dates to every role. Missing dates commonly cause a resume to be scored as incomplete.", 2);
+  }
+
+  // 6. Length ----------------------------------------------------------------
+  if (words.length < 250) {
+    add("length", "Length", "fail", words.length + " words \u2014 unusually short.",
+      "Most competitive resumes run 400\u2013800 words. Short documents may indicate content trapped in graphics or columns that did not extract.", 1);
+  } else if (words.length > 1200) {
+    add("length", "Length", "warn", words.length + " words \u2014 long.",
+      "Consider trimming older or less relevant roles so the most recent work is not buried.", 1);
+  } else {
+    add("length", "Length", "pass", words.length + " words \u2014 within the typical range.", null, 1);
+  }
+
+  // 7. Layout risk (columns and tables) --------------------------------------
+  // Runs of 3+ spaces mid-line often indicate column or table layout, which
+  // parsers frequently interleave incorrectly.
+  const suspiciousLines = nonEmpty.filter(l => /\S {3,}\S/.test(l));
+  const suspiciousRatio = nonEmpty.length ? suspiciousLines.length / nonEmpty.length : 0;
+  if (suspiciousRatio > 0.15) {
+    add("layout", "Single-column layout", "warn",
+      Math.round(suspiciousRatio * 100) + "% of lines show wide internal spacing, which can indicate columns or tables.",
+      "Use a single-column layout. Multi-column resumes are often read left-to-right across both columns, scrambling the content.", 2);
+  } else {
+    add("layout", "Single-column layout", "pass", "No strong signs of multi-column or table layout.", null, 2);
+  }
+
+  // 8. Problem characters ----------------------------------------------------
+  const oddChars = (text.match(/[\uE000-\uF8FF\u2591-\u259F]/g) || []).length;
+  if (oddChars > 0) {
+    add("chars", "Character encoding", "warn",
+      oddChars + " unusual glyphs found (often icon fonts).",
+      "Replace icon-font symbols for phone, email, and location with plain text labels. They extract as junk characters or vanish entirely.", 1);
+  } else {
+    add("chars", "Character encoding", "pass", "No icon-font or private-use characters detected.", null, 1);
+  }
+
+  // 9. Keyword coverage against market vocabulary ---------------------------
+  const intel = opts && opts.intel;
+  if (intel) {
+    const norm = (s) => (s || "").toLowerCase().replace(/[^a-z0-9]/g, "");
+    const target = intel.topMethods.concat(intel.topSoftSkills);
+    const present = target.filter(t => {
+      const parts = t.name.toLowerCase().split(" / ");
+      return parts.some(p => lower.indexOf(p.trim()) !== -1) || lower.indexOf(norm(t.name)) !== -1;
+    });
+    const pct = Math.round((present.length / target.length) * 100);
+    if (pct >= 50) {
+      add("keywords", "Market keyword coverage", "pass",
+        present.length + " of " + target.length + " in-demand terms appear (" + pct + "%).", null, 2);
+    } else if (pct >= 25) {
+      add("keywords", "Market keyword coverage", "warn",
+        "Only " + present.length + " of " + target.length + " in-demand terms appear (" + pct + "%).",
+        "Work the missing terms into your bullets and skills section using the exact words postings use. Keyword matching is literal.", 2);
+    } else {
+      add("keywords", "Market keyword coverage", "fail",
+        "Only " + present.length + " of " + target.length + " in-demand terms appear (" + pct + "%).",
+        "Your experience may be described in language that does not match how postings are written. Mirror the market's exact terms where they genuinely apply.", 2);
+    }
+  }
+
+  // 10. Job-specific keyword match ------------------------------------------
+  const jobText = opts && opts.jobText;
+  if (jobText && jobText.trim().length > 200) {
+    const stop = new Set(("the and for with you your our this that will able have has are was were from they their there них " +
+      "job role work team years experience including etc a an of to in on at as be or by is it we us who all any can may " +
+      "more most other such using across within into over about than then them these those which while would should could").split(/\s+/));
+    const jobWords = (jobText.toLowerCase().match(/[a-z][a-z+#.\-]{3,}/g) || [])
+      .filter(w => !stop.has(w));
+    const freq = {};
+    jobWords.forEach(w => { freq[w] = (freq[w] || 0) + 1; });
+    const top = Object.keys(freq)
+      .sort((a, b) => freq[b] - freq[a])
+      .slice(0, 25);
+    const matched = top.filter(w => lower.indexOf(w) !== -1);
+    const missingTop = top.filter(w => lower.indexOf(w) === -1).slice(0, 10);
+    const pct = top.length ? Math.round((matched.length / top.length) * 100) : 0;
+    if (pct >= 60) {
+      add("job_match", "Match to this posting", "pass",
+        matched.length + " of " + top.length + " key terms from the posting appear (" + pct + "%).", null, 3);
+    } else if (pct >= 35) {
+      add("job_match", "Match to this posting", "warn",
+        matched.length + " of " + top.length + " key terms appear (" + pct + "%). Missing: " + missingTop.join(", ") + ".",
+        "Add the missing terms where they honestly describe your work. Do not claim experience you lack.", 3);
+    } else {
+      add("job_match", "Match to this posting", "fail",
+        "Only " + matched.length + " of " + top.length + " key terms appear (" + pct + "%). Missing: " + missingTop.join(", ") + ".",
+        "This resume reads quite differently from the posting. Re-word real experience using the posting's vocabulary.", 3);
+    }
+  }
+
+  // Score: weighted, deterministic.
+  const totalWeight = checks.reduce((s, c) => s + c.weight, 0);
+  const earned = checks.reduce((s, c) => {
+    const v = c.status === "pass" ? 1 : c.status === "warn" ? 0.5 : 0;
+    return s + v * c.weight;
+  }, 0);
+  const score = totalWeight ? Math.round((earned / totalWeight) * 100) : 0;
+
+  let band, bandLabel;
+  if (score >= 85) { band = "pass"; bandLabel = "Strong"; }
+  else if (score >= 65) { band = "warn"; bandLabel = "Workable"; }
+  else { band = "fail"; bandLabel = "Needs work"; }
+
+  return {
+    score, band, bandLabel, checks,
+    passCount: checks.filter(c => c.status === "pass").length,
+    total: checks.length,
+  };
+}
+
+// ─── ATS REPORT ─────────────────────────────────────────────────────────────
+function AtsReport({ result, T, compact }) {
+  const [showAll, setShowAll] = useState(false);
+  if (!result) return null;
+
+  const color = result.band === "pass" ? T.success : result.band === "warn" ? T.warning : T.danger;
+  const issues = result.checks.filter(c => c.status !== "pass");
+  const shown = showAll ? result.checks : issues;
+
+  const statusDot = (status) => {
+    const c = status === "pass" ? T.success : status === "warn" ? T.warning : T.danger;
+    return (
+      <span style={{
+        width: 16, height: 16, borderRadius: 4, flexShrink: 0, marginTop: 2,
+        background: status === "pass" ? c : "transparent",
+        border: "1.5px solid " + c,
+        display: "flex", alignItems: "center", justifyContent: "center",
+        fontSize: 10, fontWeight: 700, color: status === "pass" ? "#fff" : c,
+      }}>
+        {status === "pass" ? "\u2713" : status === "warn" ? "!" : "\u00D7"}
+      </span>
+    );
+  };
+
+  return (
+    <Card T={T} style={{ marginBottom: compact ? 16 : 20 }}>
+      {/* Score header */}
+      <div style={{ display: "flex", alignItems: "center", gap: 16, marginBottom: 16 }}>
+        <div style={{
+          width: 62, height: 62, borderRadius: 12, flexShrink: 0,
+          border: "2px solid " + color,
+          display: "flex", flexDirection: "column",
+          alignItems: "center", justifyContent: "center",
+        }}>
+          <div style={{ fontSize: 20, fontWeight: 700, color, lineHeight: 1 }}>{result.score}</div>
+          <div style={{ fontSize: 9, color: T.textMuted, marginTop: 2 }}>/ 100</div>
+        </div>
+        <div style={{ flex: 1 }}>
+          <div style={{ fontSize: 14, fontWeight: 600, color: T.textBright, marginBottom: 2 }}>
+            ATS readiness: <span style={{ color }}>{result.bandLabel}</span>
+          </div>
+          <div style={{ fontSize: 12, color: T.textMuted, lineHeight: 1.5 }}>
+            {result.passCount} of {result.total} checks passed. Applicant tracking systems parse your
+            resume into fields before a person sees it; these checks reflect how reliably that works.
+          </div>
+        </div>
+      </div>
+
+      {/* Checks */}
+      <div style={{ borderTop: "1px solid " + T.border, paddingTop: 14 }}>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 10 }}>
+          <div style={{ fontSize: 11, color: T.textMuted, fontWeight: 600, textTransform: "uppercase", letterSpacing: "0.06em" }}>
+            {showAll ? "All checks" : issues.length > 0 ? "Issues to address" : "All checks passed"}
+          </div>
+          <button
+            onClick={() => setShowAll(v => !v)}
+            style={{
+              background: "none", border: "none", color: T.accentInk, cursor: "pointer",
+              fontSize: 12, fontWeight: 600, fontFamily: T.font,
+            }}
+          >
+            {showAll ? "Show issues only" : "Show all " + result.total}
+          </button>
+        </div>
+
+        {shown.length === 0 && (
+          <div style={{ fontSize: 13, color: T.success }}>
+            No issues found. This resume should parse cleanly.
+          </div>
+        )}
+
+        {shown.map((c, i) => (
+          <div key={c.id} style={{
+            display: "flex", gap: 10, alignItems: "flex-start",
+            padding: "10px 0",
+            borderBottom: i < shown.length - 1 ? "1px solid " + T.border : "none",
+          }}>
+            {statusDot(c.status)}
+            <div style={{ flex: 1, minWidth: 0 }}>
+              <div style={{ fontSize: 13, fontWeight: 600, color: T.textBright, marginBottom: 2 }}>
+                {c.label}
+              </div>
+              <div style={{ fontSize: 12, color: T.text, lineHeight: 1.5 }}>
+                {c.detail}
+              </div>
+              {c.fix && (
+                <div style={{
+                  fontSize: 12, color: T.textSecondary, lineHeight: 1.5, marginTop: 6,
+                  paddingLeft: 10, borderLeft: "2px solid " + T.accent + "55",
+                }}>
+                  {c.fix}
+                </div>
+              )}
+            </div>
+          </div>
+        ))}
+      </div>
+    </Card>
+  );
+}
+
+// Canonical ordering used to find the nearest level when a discipline's
+// salary table doesn't have an exact match for the extracted seniority.
+const SENIORITY_ORDER = ["Intern", "Entry", "Mid", "Senior", "Manager", "Lead", "Staff", "Principal", "Director", "VP", "Head"];
+
+function resolveSeniorityKey(seniority, salaryRanges) {
+  if (seniority && salaryRanges[seniority]) return { key: seniority, substituted: false };
+  const idx = SENIORITY_ORDER.indexOf(seniority);
+  if (idx === -1) return { key: "Mid", substituted: true, from: seniority };
+  // Walk outward from the requested level to find the nearest level this
+  // discipline's table actually has data for.
+  for (let d = 1; d < SENIORITY_ORDER.length; d++) {
+    const up = SENIORITY_ORDER[idx + d];
+    const down = SENIORITY_ORDER[idx - d];
+    if (up && salaryRanges[up]) return { key: up, substituted: true, from: seniority };
+    if (down && salaryRanges[down]) return { key: down, substituted: true, from: seniority };
+  }
+  return { key: "Mid", substituted: true, from: seniority };
+}
+
+// ─── JOB VS MARKET COMPARISON (deterministic — no AI) ───────────────────────
+// Takes AI-extracted job dimensions and computes every verdict in plain JS.
+// The extraction (reading free text) is AI's job; the comparison math is not.
+function compareJobToMarket(jobDims, intel) {
+  if (!jobDims || !intel) return null;
+
+  const tierKey = jobDims.location_tier && LOCATION_TIERS[jobDims.location_tier]
+    ? jobDims.location_tier
+    : "mid_metro";
+  const tier = LOCATION_TIERS[tierKey];
+  const resolved = resolveSeniorityKey(jobDims.seniority, intel.salaryRanges);
+  const seniority = resolved.key;
+  const baseRange = intel.salaryRanges[seniority];
+  const adjustedRange = baseRange
+    ? [Math.round(baseRange[0] * tier.multiplier), Math.round(baseRange[1] * tier.multiplier)]
+    : null;
+
+  // ── Salary verdict ──
+  let salary = null;
+  if (adjustedRange) {
+    if (jobDims.salary_listed && (jobDims.salary_min || jobDims.salary_max)) {
+      const jMin = jobDims.salary_min || jobDims.salary_max;
+      const jMax = jobDims.salary_max || jobDims.salary_min;
+      const jobMid = (jMin + jMax) / 2;
+      const marketMid = (adjustedRange[0] + adjustedRange[1]) / 2;
+      const pctDiff = Math.round(((jobMid - marketMid) / marketMid) * 100);
+      let verdict, detail;
+      if (jobMid < adjustedRange[0] * 0.92) {
+        verdict = "below";
+        detail = "This posting's range runs " + Math.abs(pctDiff) + "% below the typical range for a " + seniority + " " + intel.label + " role in this location tier.";
+      } else if (jobMid > adjustedRange[1] * 1.08) {
+        verdict = "above";
+        detail = "This posting's range runs " + Math.abs(pctDiff) + "% above the typical range for a " + seniority + " " + intel.label + " role in this location tier.";
+      } else {
+        verdict = "competitive";
+        detail = "This posting's range lines up with the typical market for a " + seniority + " " + intel.label + " role in this location tier.";
+      }
+      salary = { verdict, detail, jobRange: [jMin, jMax], marketRange: adjustedRange, pctDiff };
+    } else {
+      salary = {
+        verdict: "unlisted",
+        detail: "No salary range was found in the posting. For a " + seniority + " " + intel.label + " role in this location tier, the market typically pays $" +
+          Math.round(adjustedRange[0] / 1000) + "K\u2013$" + Math.round(adjustedRange[1] / 1000) + "K.",
+        jobRange: null,
+        marketRange: adjustedRange,
+        pctDiff: null,
+      };
+    }
+  }
+
+  // ── Experience-requirement verdict ──
+  let experience = null;
+  const typicalYears = TYPICAL_YEARS_BY_SENIORITY[seniority];
+  if (typicalYears && typeof jobDims.years_required === "number") {
+    const [lo, hi] = typicalYears;
+    let verdict, detail;
+    if (jobDims.years_required > hi + 2) {
+      verdict = "high";
+      detail = "Asking for " + jobDims.years_required + " years is well above the " + lo + "\u2013" + hi + " years typical for a " + seniority + " title \u2014 this may be a " + seniority + " title with more senior expectations, or a leveling mismatch.";
+    } else if (jobDims.years_required < lo && jobDims.years_required >= 0) {
+      verdict = "low";
+      detail = jobDims.years_required + " years is below the usual " + lo + "\u2013" + hi + " years for a " + seniority + " title \u2014 the role may be scoped more junior than its title suggests.";
+    } else {
+      verdict = "typical";
+      detail = jobDims.years_required + " years falls within the usual " + lo + "\u2013" + hi + " year range for a " + seniority + " title.";
+    }
+    experience = { verdict, detail, required: jobDims.years_required, typicalRange: typicalYears };
+  }
+
+  // ── Requirements-breadth verdict ──
+  let breadth = null;
+  const methodCount = (jobDims.required_methods || []).length;
+  if (methodCount > 0) {
+    const [lo, hi] = TYPICAL_METHOD_COUNT_RANGE;
+    let verdict, detail;
+    if (methodCount > hi) {
+      verdict = "demanding";
+      detail = "This posting names " + methodCount + " distinct methods or tools as requirements, more than the " + lo + "\u2013" + hi + " a typical posting lists. That can mean a genuinely broad role, or a wish-list job description.";
+    } else if (methodCount < lo) {
+      verdict = "narrow";
+      detail = "This posting names only " + methodCount + " specific method or tool, fewer than most postings. The role may be flexible on background, or the posting may be light on detail.";
+    } else {
+      verdict = "typical";
+      detail = "This posting names " + methodCount + " methods or tools, in line with a typical posting.";
+    }
+    breadth = { verdict, detail, count: methodCount, typicalRange: TYPICAL_METHOD_COUNT_RANGE };
+  }
+
+  return {
+    seniority, tierKey, tierLabel: tier.label, salary, experience, breadth,
+    seniorityNote: resolved.substituted
+      ? "This posting reads as \"" + (resolved.from || "an unrecognized level") + ",\" which " + intel.label + " market data doesn't track separately. Showing the closest tracked level, " + seniority + ", instead."
+      : null,
+  };
+}
+
+// ─── PROFILE HELPERS ────────────────────────────────────────────────────────
+// Deterministic overlap between the applicant's items and a market list. No AI.
+// Returns every market item annotated with whether the applicant has it, plus
+// matched/missing splits for counts.
+function coverage(applicantItems, marketList) {
+  const norm = (s) => (s || "").toLowerCase().replace(/[^a-z0-9]/g, "");
+  const have = new Set((applicantItems || []).map(norm).filter(Boolean));
+  const items = (marketList || []).map(m => {
+    const parts = m.name.toLowerCase().split(" / ").map(norm);
+    const hit = parts.some(p => {
+      for (const h of have) {
+        if (h.includes(p) || p.includes(h)) return true;
+      }
+      return false;
+    });
+    return { ...m, hit };
+  });
+  return {
+    items,
+    matched: items.filter(i => i.hit),
+    missing: items.filter(i => !i.hit),
+  };
+}
+
+// Shows every item in a market list, marked present or absent in the resume,
+// ordered by market demand.
+function CoverageList({ title, items, T }) {
+  return (
+    <div>
+      <div style={{ fontSize: 11, color: T.textMuted, fontWeight: 600, marginBottom: 8 }}>
+        {title}
+      </div>
+      <div>
+        {items.slice().sort((a, b) => b.pct - a.pct).map((it, i) => (
+          <div key={i} style={{
+            display: "flex", alignItems: "center", gap: 10,
+            padding: "7px 0",
+            borderBottom: i < items.length - 1 ? "1px solid " + T.border : "none",
+          }}>
+            {/* Present / absent marker */}
+            <span style={{
+              width: 18, height: 18, borderRadius: 5, flexShrink: 0,
+              display: "flex", alignItems: "center", justifyContent: "center",
+              fontSize: 11, fontWeight: 700,
+              background: it.hit ? T.success : "transparent",
+              border: "1.5px solid " + (it.hit ? T.success : T.borderStrong),
+              color: "#fff",
+            }}>
+              {it.hit ? "\u2713" : ""}
+            </span>
+            <span style={{
+              flex: 1, fontSize: 13,
+              color: it.hit ? T.textBright : T.textMuted,
+              fontWeight: it.hit ? 500 : 400,
+            }}>
+              {it.name}
+            </span>
+            {/* Market demand bar */}
+            <div style={{ width: 70, height: 5, background: T.bgInput, borderRadius: 3, overflow: "hidden", flexShrink: 0 }}>
+              <div style={{
+                width: it.pct + "%", height: "100%", borderRadius: 3,
+                background: it.hit ? T.success : T.textDim,
+              }} />
+            </div>
+            <span style={{
+              width: 34, fontSize: 11, textAlign: "right", flexShrink: 0,
+              color: it.hit ? T.textSecondary : T.textMuted,
+            }}>
+              {it.pct}%
+            </span>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+// ─── RESUME PROFILE ─────────────────────────────────────────────────────────
+function Chips({ items, T, tone }) {
+  if (!items || items.length === 0) {
+    return <span style={{ fontSize: 12, color: T.textDim }}>None found</span>;
+  }
+  return (
+    <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
+      {items.map((it, i) => (
+        <span key={i} style={{
+          padding: "4px 10px", fontSize: 12, borderRadius: 6,
+          background: tone === "accent" ? T.accentSoft : T.bgInput,
+          color: tone === "accent" ? T.accentInk : T.textSecondary,
+          border: "1px solid " + (tone === "accent" ? T.accent + "33" : T.borderStrong),
+        }}>
+          {it}
+        </span>
+      ))}
+    </div>
+  );
+}
+
+
+function ProfileField({ label, children, T }) {
+  return (
+    <div style={{ marginBottom: 16 }}>
+      <div style={{ fontSize: 10, color: T.textMuted, textTransform: "uppercase", letterSpacing: "0.06em", fontWeight: 600, marginBottom: 6 }}>
+        {label}
+      </div>
+      {children}
+    </div>
+  );
+}
+
+function ResumeProfile({ profile, loading, error, discipline, T, collapsedByDefault }) {
+  const [open, setOpen] = useState(!collapsedByDefault);
+
+  if (loading) {
+    return (
+      <div style={{ fontSize: 12, color: T.textMuted, marginBottom: 12 }}>
+        Analyzing your resume in the background...
+      </div>
+    );
+  }
+  if (error) {
+    // Not a blocker — the ATS assessment is deterministic and the resume text
+    // is captured for tailoring. The AI profile is an enrichment.
+    return (
+      <div style={{ fontSize: 12, color: T.textMuted, marginBottom: 12 }}>
+        Detailed profile unavailable right now. Your resume is still ready for tailoring, and the ATS assessment below uses it directly.
+      </div>
+    );
+  }
+  if (!profile) return null;
+
+  const intel = MARKET_INTEL[profile.discipline] || MARKET_INTEL[discipline];
+  const methodCov = intel ? coverage(profile.methods, intel.topMethods) : null;
+  const skillCov = intel ? coverage(profile.soft_skills, intel.topSoftSkills) : null;
+
+  return (
+    <Card T={T} style={{ marginBottom: 20 }}>
+      {/* Header */}
+      <div
+        onClick={() => setOpen(o => !o)}
+        style={{ display: "flex", alignItems: "center", justifyContent: "space-between", cursor: "pointer" }}
+      >
+        <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+          <div style={{
+            width: 30, height: 30, borderRadius: 8, flexShrink: 0,
+            background: T.accentSoft, color: T.accentInk,
+            display: "flex", alignItems: "center", justifyContent: "center",
+            fontSize: 14, fontWeight: 700,
+          }}>
+            {"\u25C8"}
+          </div>
+          <div>
+            <div style={{ fontSize: 14, fontWeight: 600, color: T.textBright }}>Your profile</div>
+            <div style={{ fontSize: 12, color: T.textMuted }}>
+              {(MARKET_INTEL[profile.discipline]?.label || "")}{profile.seniority ? " \u00B7 " + profile.seniority : ""}{profile.years_experience ? " \u00B7 " + profile.years_experience + " yrs" : ""}
+            </div>
+          </div>
+        </div>
+        <span style={{ fontSize: 12, color: T.textMuted }}>{open ? "Hide" : "Show"}</span>
+      </div>
+
+      {open && (
+        <div style={{ marginTop: 18 }}>
+          {profile.summary && (
+            <div style={{ fontSize: 13, color: T.textBright, lineHeight: 1.6, marginBottom: 18, paddingBottom: 16, borderBottom: "1px solid " + T.border }}>
+              {profile.summary}
+            </div>
+          )}
+
+          {/* Top row: seniority, experience, degree, AI */}
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: 12, marginBottom: 20 }}>
+            <div>
+              <div style={{ fontSize: 10, color: T.textMuted, textTransform: "uppercase", letterSpacing: "0.06em", fontWeight: 600, marginBottom: 4 }}>Seniority</div>
+              <div style={{ fontSize: 16, fontWeight: 700, color: T.textBright }}>{profile.seniority || "\u2014"}</div>
+            </div>
+            <div>
+              <div style={{ fontSize: 10, color: T.textMuted, textTransform: "uppercase", letterSpacing: "0.06em", fontWeight: 600, marginBottom: 4 }}>Experience</div>
+              <div style={{ fontSize: 16, fontWeight: 700, color: T.textBright }}>{profile.years_experience ? profile.years_experience + " yrs" : "\u2014"}</div>
+            </div>
+            <div>
+              <div style={{ fontSize: 10, color: T.textMuted, textTransform: "uppercase", letterSpacing: "0.06em", fontWeight: 600, marginBottom: 4 }}>Degree</div>
+              <div style={{ fontSize: 14, fontWeight: 700, color: T.textBright }}>{profile.degree_level || "\u2014"}</div>
+              {profile.degree_field && <div style={{ fontSize: 11, color: T.textMuted, marginTop: 2 }}>{profile.degree_field}</div>}
+            </div>
+            <div>
+              <div style={{ fontSize: 10, color: T.textMuted, textTransform: "uppercase", letterSpacing: "0.06em", fontWeight: 600, marginBottom: 4 }}>AI experience</div>
+              <div style={{ fontSize: 16, fontWeight: 700, color: profile.ai_experience ? T.accentInk : T.textBright }}>
+                {profile.ai_experience ? "Yes" : "No"}
+              </div>
+            </div>
+          </div>
+
+          {profile.seniority_rationale && (
+            <div style={{ fontSize: 12, color: T.textMuted, marginBottom: 18, lineHeight: 1.5 }}>
+              {profile.seniority_rationale}
+            </div>
+          )}
+
+          <ProfileField label="Methods" T={T}><Chips items={profile.methods} T={T} tone="accent" /></ProfileField>
+          <ProfileField label="Tools" T={T}><Chips items={profile.tools} T={T} /></ProfileField>
+          <ProfileField label="Soft skills" T={T}><Chips items={profile.soft_skills} T={T} /></ProfileField>
+          <ProfileField label="Industries" T={T}><Chips items={profile.industries} T={T} /></ProfileField>
+          {profile.specializations && profile.specializations.length > 0 && (
+            <ProfileField label="Standout strengths" T={T}><Chips items={profile.specializations} T={T} tone="accent" /></ProfileField>
+          )}
+          {profile.ai_context && (
+            <ProfileField label="AI context" T={T}>
+              <div style={{ fontSize: 12, color: T.text, lineHeight: 1.5 }}>{profile.ai_context}</div>
+            </ProfileField>
+          )}
+
+          {/* Deterministic market coverage */}
+          {intel && methodCov && (
+            <div style={{ marginTop: 20, paddingTop: 18, borderTop: "1px solid " + T.border }}>
+              <div style={{ fontSize: 10, color: T.textMuted, textTransform: "uppercase", letterSpacing: "0.06em", fontWeight: 600, marginBottom: 4 }}>
+                Coverage against {intel.label} market
+              </div>
+              <div style={{ fontSize: 13, color: T.textBright, marginBottom: 6 }}>
+                You have <strong style={{ color: T.accentInk }}>{methodCov.matched.length} of {intel.topMethods.length}</strong> of the most-requested methods
+                {skillCov && <> and <strong style={{ color: T.accentInk }}>{skillCov.matched.length} of {intel.topSoftSkills.length}</strong> top soft skills</>}.
+              </div>
+              <div style={{ fontSize: 11, color: T.textDim, marginBottom: 16 }}>
+                Checked items appear in your resume. Percentages show how often each is requested in postings.
+              </div>
+
+              <div style={{ marginBottom: 20 }}>
+                <CoverageList title="Most-requested methods" items={methodCov.items} T={T} />
+              </div>
+              {skillCov && (
+                <CoverageList title="Most-requested soft skills" items={skillCov.items} T={T} />
+              )}
+            </div>
+          )}
+        </div>
+      )}
+    </Card>
+  );
+}
+
+// ─── VOICE SUMMARY ──────────────────────────────────────────────────────────
+function VoiceSummary({ summary, loading, error, T }) {
+  if (loading) {
+    return (
+      <div style={{ fontSize: 12, color: T.textMuted, marginBottom: 12 }}>
+        Analyzing your writing style in the background...
+      </div>
+    );
+  }
+  if (error) {
+    // Not a blocker — the voice text is captured and will be used.
+    return (
+      <div style={{ fontSize: 12, color: T.textMuted, marginBottom: 12 }}>
+        Style preview unavailable right now. Your voice profile will still be used when generating cover letters.
+      </div>
+    );
+  }
+  if (!summary) return null;
+
+  return (
+    <Card T={T} style={{ marginBottom: 16 }}>
+      <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 14 }}>
+        <div style={{
+          width: 30, height: 30, borderRadius: 8, flexShrink: 0,
+          background: T.accentSoft, color: T.accentInk,
+          display: "flex", alignItems: "center", justifyContent: "center",
+          fontSize: 15, fontWeight: 700,
+        }}>
+          {"\u270E"}
+        </div>
+        <div style={{ fontSize: 14, fontWeight: 600, color: T.textBright }}>Your writing style</div>
+      </div>
+
+      {summary.summary && (
+        <div style={{ fontSize: 13, color: T.textBright, lineHeight: 1.6, marginBottom: 16 }}>
+          {summary.summary}
+        </div>
+      )}
+
+      {summary.tone && summary.tone.length > 0 && (
+        <ProfileField label="Tone" T={T}><Chips items={summary.tone} T={T} tone="accent" /></ProfileField>
+      )}
+      {summary.characteristics && summary.characteristics.length > 0 && (
+        <ProfileField label="Characteristics" T={T}><Chips items={summary.characteristics} T={T} /></ProfileField>
+      )}
+      {summary.avoids && summary.avoids.length > 0 && (
+        <ProfileField label="Avoids" T={T}><Chips items={summary.avoids} T={T} /></ProfileField>
+      )}
+    </Card>
+  );
+}
+
+function UploadZone({ accept, label, hint, fileName, onFile, onClear, extracting, error, T }) {
+  const inputRef = useRef(null);
+  const [dragOver, setDragOver] = useState(false);
+
+  const handleFile = (file) => { if (file) onFile(file); };
+  const handleDrop = (e) => { e.preventDefault(); setDragOver(false); handleFile(e.dataTransfer.files[0]); };
+
+  if (fileName) {
+    return (
+      <div style={{
+        display: "flex", alignItems: "center", gap: 10,
+        background: T.accentSoft, border: "1px solid " + T.accent + "33",
+        borderRadius: 8, padding: "10px 14px",
+      }}>
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke={T.accentInk} strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+          <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" />
+          <polyline points="14 2 14 8 20 8" />
+        </svg>
+        <span style={{ flex: 1, fontSize: 13, color: T.accentInk, fontWeight: 500 }}>{fileName}</span>
+        <button onClick={onClear} style={{
+          background: "none", border: "none", color: T.textMuted, cursor: "pointer",
+          fontSize: 16, fontFamily: T.font, padding: "0 4px",
+        }}>{"\u00D7"}</button>
+      </div>
+    );
+  }
+
+  return (
+    <div>
+      <div
+        onDragOver={(e) => { e.preventDefault(); setDragOver(true); }}
+        onDragLeave={() => setDragOver(false)}
+        onDrop={handleDrop}
+        onClick={() => inputRef.current?.click()}
+        style={{
+          border: "2px dashed " + (dragOver ? T.accent : T.borderStrong),
+          borderRadius: 10, padding: "32px 20px", textAlign: "center",
+          cursor: "pointer", transition: "border-color 0.15s, background 0.15s",
+          background: dragOver ? T.accentSoft : T.bgSubtle,
+        }}
+      >
+        <input
+          ref={inputRef} type="file" accept={accept}
+          style={{ display: "none" }}
+          onChange={(e) => handleFile(e.target.files[0])}
+        />
+        {extracting ? (
+          <div style={{ fontSize: 13, color: T.textMuted }}>Reading file...</div>
+        ) : (
+          <div>
+            <div style={{ fontSize: 13, color: T.textBright, fontWeight: 500, marginBottom: 4 }}>{label}</div>
+            <div style={{ fontSize: 12, color: T.textMuted }}>{hint}</div>
+          </div>
+        )}
+      </div>
+      {error && <div style={{ fontSize: 12, color: T.danger, marginTop: 6 }}>{error}</div>}
+    </div>
+  );
+}
+
+// ─── MAIN ───────────────────────────────────────────────────────────────────
+function Tailor() {
+  const [theme, setTheme] = useState("light");
+  // Setup wizard: "resume" → "voice" → "ready"
+  // Once ready, main flow: "input" → "loading" → "results"
+  const [setupStep, setSetupStep] = useState("resume");
+  const [step, setStep] = useState("input");
+
+  // Uploaded files
+  const [resumeFileName, setResumeFileName] = useState("");
+  const [resumeText, setResumeText] = useState("");
+  const [voiceFileName, setVoiceFileName] = useState("");
+  const [voiceText, setVoiceText] = useState("");
+  const [extracting, setExtracting] = useState(false);
+  const [fileError, setFileError] = useState(null);
+
+  // Resume profile (extracted across Meridian dimensions)
+  const [profile, setProfile] = useState(null);
+  const [profileLoading, setProfileLoading] = useState(false);
+  const [profileError, setProfileError] = useState(null);
+
+  // Voice profile writing-style summary
+  const [voiceSummary, setVoiceSummary] = useState(null);
+  const [voiceLoading, setVoiceLoading] = useState(false);
+  const [voiceError, setVoiceError] = useState(null);
+
+  // Job posting dimensions, extracted from the pasted job description so it
+  // can be compared against market norms for that seniority and location.
+  const [jobDims, setJobDims] = useState(null);
+  const [jobDimsLoading, setJobDimsLoading] = useState(false);
+  const [jobDimsError, setJobDimsError] = useState(null);
+  const lastAnalyzedJobRef = useRef("");
+
+  // Paste-instead-of-upload mode
+  const [resumePasteMode, setResumePasteMode] = useState(false);
+  const [resumePaste, setResumePaste] = useState("");
+  const [voicePasteMode, setVoicePasteMode] = useState(false);
+  const [voicePaste, setVoicePaste] = useState("");
+
+  // Job analysis
+  const [jobText, setJobText] = useState("");
+  const [discipline, setDiscipline] = useState("uxr");
+  const [seniority, setSeniority] = useState("Mid");
+  const [activeTab, setActiveTab] = useState("cover");
+  const [results, setResults] = useState(null);
+  const [error, setError] = useState(null);
+  const [regenerating, setRegenerating] = useState(false);
+  const [rewordingIdx, setRewordingIdx] = useState(null);
+
+  // UI
+  const [showAbout, setShowAbout] = useState(false);
+  const [showSettings, setShowSettings] = useState(false);
+  const abortRef = useRef(null);
+
+  const T = theme === "dark" ? DARK_TOKENS : LIGHT_TOKENS;
+  const isReady = setupStep === "ready";
+
+  // Deterministic ATS assessment. Recomputes when the resume, detected
+  // discipline, or job description changes. No AI involved.
+  const atsResult = useMemo(() => {
+    if (!resumeText || resumeText.trim().length < 50) return null;
+    return assessATS(resumeText, {
+      intel: MARKET_INTEL[(profile && profile.discipline) || discipline],
+      jobText: jobText,
+    });
+  }, [resumeText, profile, discipline, jobText]);
+
+  useEffect(() => {
+    if (typeof document !== "undefined" && document.body) {
+      document.body.style.background = T.bg;
+      document.body.style.transition = "background 0.2s ease";
+    }
+  }, [theme]);
+
+  useEffect(() => {
+    if (jobText.length > 50) {
+      setDiscipline(detectDiscipline(jobText));
+      setSeniority(detectSeniority(jobText));
+    }
+  }, [jobText]);
+
+  // ── Extract resume profile across Meridian dimensions ──
+  const analyzeResume = useCallback(async (text) => {
+    setProfileLoading(true);
+    setProfileError(null);
+    const full = sanitizeText(text);
+
+    // Minimal instruction. Avoid special chars in the schema that might trip the proxy.
+    const build = function(excerpt) {
+      return "Read this resume. Reply with a JSON object only, no other text. " +
+        "Keys: discipline (uxr or design or pm), seniority, seniority_rationale, " +
+        "years_experience, methods (array), tools (array), soft_skills (array), " +
+        "degree_level, degree_field, ai_experience (bool), ai_context, " +
+        "industries (array), specializations (array), summary.\n\n" + excerpt;
+    };
+
+    const budgets = [2500];
+
+    try {
+      const controller = new AbortController();
+      let parsed = null;
+      let lastErr = null;
+
+      for (const budget of budgets) {
+        try {
+          const rawText = await callClaude(build(full.slice(0, budget)), controller.signal);
+          parsed = parseModelJson(rawText);
+          if (parsed) break;
+          lastErr = new Error("Could not read the profile from the response.");
+        } catch (e) {
+          if (e.name === "AbortError") throw e;
+          lastErr = e;
+          const msg = e.message || "";
+          if (msg.indexOf("Empty body") === -1 && msg.indexOf("no text") === -1 && msg.indexOf("read response") === -1) throw e;
+        }
+      }
+
+      if (!parsed) throw (lastErr || new Error("Could not analyze the resume."));
+
+      setProfile(parsed);
+      // Prime the seniority used for market comparisons from the resume, unless a
+      // job description later overrides it.
+      if (parsed.seniority) setSeniority(parsed.seniority);
+      if (parsed.discipline && MARKET_INTEL[parsed.discipline]) setDiscipline(parsed.discipline);
+    } catch (err) {
+      if (err.name === "AbortError") return;
+      const detail = (err && err.message ? err.message : String(err));
+      setProfileError("Profile analysis failed \u2014 " + detail);
+    } finally {
+      setProfileLoading(false);
+    }
+  }, []);
+
+  // ── Summarize writing style from the voice profile ──
+  const analyzeVoice = useCallback(async (text) => {
+    setVoiceLoading(true);
+    setVoiceError(null);
+    const full = sanitizeText(text);
+
+    const build = (budget) =>
+      "Summarize this author's writing style. Respond with ONLY a JSON object, no other text, with keys: tone (array of 3-5 adjectives), characteristics (array of 3-5 short phrases), avoids (array, may be empty), summary (two sentences).\n\nVOICE PROFILE:\n" +
+      full.slice(0, budget);
+
+    try {
+      const controller = new AbortController();
+      let parsed = null;
+      let lastErr = null;
+      for (const budget of [2000]) {
+        try {
+          const rawText = await callClaude(build(budget), controller.signal);
+          parsed = parseModelJson(rawText);
+          if (parsed) break;
+          lastErr = new Error("Could not read the writing style from the response.");
+        } catch (e) {
+          if (e.name === "AbortError") throw e;
+          lastErr = e;
+          const msg = e.message || "";
+          if (msg.indexOf("Empty body") === -1 && msg.indexOf("no text") === -1) throw e;
+        }
+      }
+      if (!parsed) throw (lastErr || new Error("Could not analyze the voice profile."));
+      setVoiceSummary(parsed);
+    } catch (err) {
+      if (err.name === "AbortError") return;
+      setVoiceError(err.message || "Could not analyze the voice profile.");
+    } finally {
+      setVoiceLoading(false);
+    }
+  }, []);
+
+  // ── Extract structured dimensions from the job posting itself ──
+  // AI reads the free text; every comparison against market data afterward is
+  // computed in compareJobToMarket, not by the model.
+  const extractJobDimensions = useCallback(async (text) => {
+    setJobDimsLoading(true);
+    setJobDimsError(null);
+    const full = sanitizeText(text);
+
+    const build = (budget) =>
+      "Read this job posting and reply with a JSON object only, no other text. Keys: " +
+      "seniority (one of Intern, Entry, Mid, Senior, Lead, Staff, Principal, Manager, Director, VP, Head), " +
+      "location_tier (one of major_metro, mid_metro, remote, lower_cost \u2014 major_metro for SF/NYC/Seattle/Boston/etc, remote if the posting says remote with no major-metro anchor, lower_cost for smaller or lower cost-of-living cities, mid_metro otherwise), " +
+      "salary_listed (bool, true only if the posting states an actual number or range), " +
+      "salary_min (number or null), salary_max (number or null), " +
+      "years_required (number \u2014 the minimum years of experience explicitly required, best estimate), " +
+      "required_methods (array of specific methods or tools explicitly required, not nice-to-haves), " +
+      "degree_required (bool), remote_allowed (bool).\n\n" + excerptLabel(budget) + "\n\n" + full.slice(0, budget);
+
+    // Small helper text so the model knows this may be a partial excerpt.
+    function excerptLabel(n) { return n < full.length ? "(excerpt)" : ""; }
+
+    try {
+      const controller = new AbortController();
+      let parsed = null;
+      let lastErr = null;
+      for (const budget of [2500]) {
+        try {
+          const rawText = await callClaude(build(budget), controller.signal);
+          parsed = parseModelJson(rawText);
+          if (parsed) break;
+          lastErr = new Error("Could not read the job details from the response.");
+        } catch (e) {
+          if (e.name === "AbortError") throw e;
+          lastErr = e;
+          const msg = e.message || "";
+          if (msg.indexOf("Empty body") === -1 && msg.indexOf("no text") === -1) throw e;
+        }
+      }
+      if (!parsed) throw (lastErr || new Error("Could not analyze the posting."));
+      setJobDims(parsed);
+    } catch (err) {
+      if (err.name === "AbortError") return;
+      setJobDimsError(err.message || "Could not analyze the posting.");
+    } finally {
+      setJobDimsLoading(false);
+    }
+  }, []);
+
+  // Debounced auto-trigger: once the job description settles (user stops
+  // typing/pasting) at a useful length, extract its dimensions. Skipped if
+  // this exact text was already analyzed.
+  useEffect(() => {
+    if (jobText.trim().length < 150) return;
+    if (jobText === lastAnalyzedJobRef.current) return;
+    const t = setTimeout(() => {
+      lastAnalyzedJobRef.current = jobText;
+      extractJobDimensions(jobText);
+    }, 1500);
+    return () => clearTimeout(t);
+  }, [jobText, extractJobDimensions]);
+
+  // ── File handling ──
+  // AI calls run in the background. The user can always proceed without waiting.
+  const handleResumeFile = async (file) => {
+    setFileError(null);
+    setExtracting(true);
+    try {
+      const text = await extractFileText(file);
+      if (!text || text.trim().length < 20) throw new Error("Could not extract enough text from this file.");
+      setResumeText(text);
+      setResumeFileName(file.name);
+      setProfile(null);
+      setExtracting(false);
+      // Non-blocking — don't await. The profile card will appear when it arrives.
+      analyzeResume(text);
+    } catch (e) {
+      setFileError(e.message || "Could not read file.");
+      setExtracting(false);
+    }
+  };
+
+  const handleVoiceFile = async (file) => {
+    setFileError(null);
+    setExtracting(true);
+    try {
+      const text = await extractFileText(file);
+      if (!text || text.trim().length < 10) throw new Error("Could not extract text from this file.");
+      setVoiceText(text);
+      setVoiceFileName(file.name);
+      setVoiceSummary(null);
+      setExtracting(false);
+      // Non-blocking.
+      analyzeVoice(text);
+    } catch (e) {
+      setFileError(e.message || "Could not read file.");
+      setExtracting(false);
+    }
+  };
+
+  const skipVoice = () => {
+    setSetupStep("ready");
+  };
+
+  // ── Paste-text handlers (alternative to file upload) ──
+  const submitResumePaste = () => {
+    const text = resumePaste.trim();
+    if (text.length < 20) {
+      setFileError("Please paste more of your resume to continue.");
+      return;
+    }
+    setFileError(null);
+    setResumeText(text);
+    setResumeFileName("Pasted resume");
+    setProfile(null);
+    // Non-blocking.
+    analyzeResume(text);
+  };
+
+  const submitVoicePaste = () => {
+    const text = voicePaste.trim();
+    if (text.length < 10) {
+      setFileError("Please paste more text to continue.");
+      return;
+    }
+    setFileError(null);
+    setVoiceText(text);
+    setVoiceFileName("Pasted voice profile");
+    setVoiceSummary(null);
+    // Non-blocking.
+    analyzeVoice(text);
+  };
+
+  const clearResume = () => {
+    setResumeText("");
+    setResumeFileName("");
+    setProfile(null);
+    setProfileError(null);
+    setResumePaste("");
+    setResumePasteMode(false);
+  };
+
+  const clearVoice = () => {
+    setVoiceText("");
+    setVoiceFileName("");
+    setVoiceSummary(null);
+    setVoiceError(null);
+    setVoicePaste("");
+    setVoicePasteMode(false);
+  };
+
+  // ── Analysis ──
+  const analyze = useCallback(async () => {
+    if (!jobText.trim() || !resumeText.trim()) return;
+    setStep("loading");
+    setError(null);
+    setResults(null);
+
+    const intel = MARKET_INTEL[discipline];
+    const salaryRange = intel.salaryRanges[seniority];
+
+    const fullJob = sanitizeText(jobText);
+    const fullResume = sanitizeText(resumeText);
+    const cleanVoice = sanitizeText(voiceText).slice(0, 800);
+
+    const marketLine = "MARKET CONTEXT FOR " + intel.label.toUpperCase() + " (" + seniority + " level): Top methods: " + intel.topMethods.slice(0, 5).map(m => m.name + " (" + m.pct + "%)").join(", ") + ". Top soft skills: " + intel.topSoftSkills.slice(0, 4).map(s => s.name + " (" + s.pct + "%)").join(", ") + ". " + intel.aiMentionRate + "% of postings mention AI.";
+
+    let voiceInstructions = "";
+    if (cleanVoice) {
+      voiceInstructions = "\n\nVOICE PROFILE (match this writing style in the cover letter without mentioning it):\n" + cleanVoice;
+    }
+
+    let profileInstructions = "";
+    if (profile) {
+      profileInstructions = "\n\nAPPLICANT PROFILE: " + sanitizeText(JSON.stringify({
+        seniority: profile.seniority,
+        years_experience: profile.years_experience,
+        methods: (profile.methods || []).slice(0, 8),
+        tools: (profile.tools || []).slice(0, 8),
+        specializations: (profile.specializations || []).slice(0, 4),
+      })).slice(0, 700);
+    }
+
+    // Pass the deterministic ATS findings so suggestions address real parsing
+    // gaps rather than the model guessing at them.
+    let atsInstructions = "";
+    if (atsResult) {
+      const issues = atsResult.checks
+        .filter(c => c.status !== "pass")
+        .map(c => c.label + ": " + c.detail)
+        .join("; ");
+      if (issues) {
+        atsInstructions = "\n\nATS ISSUES DETECTED (address the relevant ones in your suggestions): " +
+          sanitizeText(issues).slice(0, 600);
+      }
+    }
+
+    // max_tokens is fixed at 1000 by the platform, so the work is split into two
+    // smaller calls rather than one large one that would truncate.
+    const budgets = [3500];
+
+    const runWithFallback = async (buildPrompt, controller) => {
+      let lastErr = null;
+      // Two passes: the model sometimes returns unparseable output once, then
+      // clean JSON on a fresh attempt.
+      for (let pass = 0; pass < 2; pass++) {
+        for (const budget of budgets) {
+          try {
+            const raw = await callClaude(buildPrompt(budget), controller.signal);
+            const parsed = parseModelJson(raw);
+            if (parsed) return parsed;
+            lastErr = new Error("could not read the response");
+          } catch (e) {
+            if (e.name === "AbortError") throw e;
+            lastErr = e;
+            const msg = e.message || "";
+            if (msg.indexOf("Empty body") === -1 && msg.indexOf("no text") === -1) throw e;
+          }
+        }
+      }
+      throw (lastErr || new Error("Something went wrong."));
+    };
+
+    try {
+      const controller = new AbortController();
+      abortRef.current = controller;
+
+      // Call 1: cover letter and positioning.
+      const letterPart = await runWithFallback((budget) =>
+        "You are an expert career advisor. Write a tailored cover letter.\n\n" +
+        "Respond with ONLY a JSON object, no other text, with keys: cover_letter (about 250 words, professional and specific, referencing real experience from the resume and real requirements from the posting), position_strength (one sentence naming the applicant's strongest angle).\n\n" +
+        marketLine + voiceInstructions + profileInstructions +
+        "\n\nJOB DESCRIPTION:\n" + fullJob.slice(0, budget) +
+        "\n\nAPPLICANT RESUME:\n" + fullResume.slice(0, budget)
+      , controller);
+
+      // Call 2: resume suggestions only (kept to 3 so the response fits).
+      const suggestPart = await runWithFallback((budget) =>
+        "You are an expert career advisor. Suggest the 3 highest-impact resume improvements for this application.\n\n" +
+        "Respond with ONLY a JSON object, no other text, with key: suggestions (array of exactly 3 objects, each with area (short name), gap (what is missing, or null), suggestion (one sentence), wording (the exact text to add, first person, one to two sentences), location (where it goes, e.g. Summary, Experience, Skills)).\n\n" +
+        marketLine + profileInstructions + atsInstructions +
+        "\n\nJOB DESCRIPTION:\n" + fullJob.slice(0, budget) +
+        "\n\nAPPLICANT RESUME:\n" + fullResume.slice(0, budget)
+      , controller);
+
+      // Call 3: interview talking points (small, so it always fits).
+      const talkPart = await runWithFallback((budget) =>
+        "You are an expert career advisor. Give 5 interview talking points for this application.\n\n" +
+        "Respond with ONLY a JSON object, no other text, with key: talking_points (array of 5 short strings, each one sentence).\n\n" +
+        marketLine + profileInstructions +
+        "\n\nJOB DESCRIPTION:\n" + fullJob.slice(0, Math.min(budget, 2500)) +
+        "\n\nAPPLICANT RESUME:\n" + fullResume.slice(0, Math.min(budget, 2500))
+      , controller);
+
+      setResults({
+        cover_letter: letterPart.cover_letter || "",
+        position_strength: letterPart.position_strength || "",
+        suggestions: suggestPart.suggestions || [],
+        talking_points: talkPart.talking_points || [],
+      });
+      setStep("results");
+      setActiveTab("cover");
+    } catch (err) {
+      if (err.name === "AbortError") return;
+      const msg = err.message || "";
+      if (msg.indexOf("Empty body") !== -1 || msg.indexOf("no text") !== -1 || msg.indexOf("could not read") !== -1) {
+        setError("The AI service is not responding reliably in this preview environment. The ATS assessment and your uploaded documents are still ready. To generate a cover letter and resume suggestions, deploy Tailor to your own server where API calls run reliably.");
+      } else {
+        setError(msg || "Something went wrong.");
+      }
+      setStep("input");
+    }
+  }, [jobText, resumeText, voiceText, discipline, seniority, profile, atsResult]);
+
+  // ── Regenerate cover letter with edit instructions ──
+  const regenerateCoverLetter = useCallback(async (editRequest, onDone) => {
+    if (!results?.cover_letter || !editRequest.trim()) return;
+    setRegenerating(true);
+    setError(null);
+
+    const cleanVoice = sanitizeText(voiceText).slice(0, 2000);
+    let voiceLine = "";
+    if (cleanVoice) {
+      voiceLine = "\n\nMatch this writing style without mentioning it:\n" + cleanVoice;
+    }
+
+    const prompt = "You are a career advisor. Revise the cover letter below based on the requested changes. Keep it professional and specific. Respond ONLY with the revised cover letter text, no preamble, no quotes, no markdown." + voiceLine + "\n\nREQUESTED CHANGES:\n" + sanitizeText(editRequest) + "\n\nCURRENT COVER LETTER:\n" + sanitizeText(results.cover_letter);
+
+    try {
+      const controller = new AbortController();
+      abortRef.current = controller;
+      const rawText = await callClaude(prompt, controller.signal);
+      const revised = rawText.trim();
+      if (!revised) throw new Error("Empty response. Try again.");
+      setResults(r => ({ ...r, cover_letter: revised }));
+      if (onDone) onDone();
+    } catch (err) {
+      if (err.name === "AbortError") return;
+      setError(err.message || "Could not regenerate. Try again.");
+    } finally {
+      setRegenerating(false);
+    }
+  }, [results, voiceText]);
+
+  // ── Reword a single resume suggestion ──
+  const rewordSuggestion = useCallback(async (idx, rewordRequest, onDone) => {
+    if (!results?.suggestions?.[idx] || !rewordRequest.trim()) return;
+    setRewordingIdx(idx);
+    setError(null);
+
+    const s = results.suggestions[idx];
+    const prompt = "You are a career advisor. Revise the resume suggestion wording below based on the requested change. Respond ONLY with a JSON object (no markdown) with keys: wording (the revised resume text in first person), suggestion (updated one-line rationale). Keep it concise.\n\nREQUESTED CHANGE:\n" + sanitizeText(rewordRequest) + "\n\nCURRENT WORDING:\n" + sanitizeText(s.wording || s.suggestion) + "\n\nCONTEXT (area): " + sanitizeText(s.area || "");
+
+    try {
+      const controller = new AbortController();
+      abortRef.current = controller;
+      const rawText = await callClaude(prompt, controller.signal);
+      // If it didn't return JSON, treat the whole response as the new wording.
+      const parsed = parseModelJson(rawText) || { wording: rawText.trim() };
+      setResults(r => {
+        const next = { ...r, suggestions: r.suggestions.slice() };
+        next.suggestions[idx] = {
+          ...next.suggestions[idx],
+          wording: parsed.wording || next.suggestions[idx].wording,
+          suggestion: parsed.suggestion || next.suggestions[idx].suggestion,
+        };
+        return next;
+      });
+      if (onDone) onDone();
+    } catch (err) {
+      if (err.name === "AbortError") return;
+      setError(err.message || "Could not reword. Try again.");
+    } finally {
+      setRewordingIdx(null);
+    }
+  }, [results]);
+
+  const reset = () => {
+    if (abortRef.current) abortRef.current.abort();
+    setStep("input");
+    setResults(null);
+    setError(null);
+  };
+
+  const canAnalyze = jobText.trim().length > 50 && resumeText.trim().length > 50;
+
+  // ── Step indicator ──
+  const stepNumber = setupStep === "resume" ? 1 : setupStep === "voice" ? 2 : 3;
+
+  return (
+    <div style={{
+      minHeight: "100vh", background: T.bg, color: T.text,
+      fontFamily: T.font, fontSize: 14, lineHeight: 1.55,
+      WebkitFontSmoothing: "antialiased",
+    }}>
+      <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap" rel="stylesheet" />
+
+      {/* ── HEADER ──────────────────────────────────────────────────── */}
+      <div style={{
+        background: T.bgCard, borderBottom: "1px solid " + T.border,
+        padding: "10px 20px", display: "flex", alignItems: "center",
+        gap: 10, flexWrap: "wrap",
+      }}>
+        {/* App icon */}
+        <div style={{
+          width: 32, height: 32, borderRadius: 8, flexShrink: 0,
+          background: "linear-gradient(135deg, " + T.accent + ", " + T.accentInk + ")",
+          display: "flex", alignItems: "center", justifyContent: "center",
+        }}>
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#fff" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+            <circle cx="6" cy="6" r="3" />
+            <circle cx="6" cy="18" r="3" />
+            <line x1="20" y1="4" x2="8.12" y2="15.88" />
+            <line x1="14.47" y1="14.48" x2="20" y2="20" />
+            <line x1="8.12" y1="8.12" x2="12" y2="12" />
+          </svg>
+        </div>
+
+        <span style={{ fontSize: 16, fontWeight: 700, color: T.textBright, letterSpacing: "-0.02em" }}>
+          Tailor
+        </span>
+
+        <button
+          onClick={() => setShowAbout(true)}
+          style={{
+            background: T.accent, color: "#fff", border: "none", borderRadius: 14,
+            padding: "4px 12px", fontSize: 11, fontWeight: 600, cursor: "pointer",
+            fontFamily: T.font, whiteSpace: "nowrap",
+          }}
+        >
+          What does this tool do?
+        </button>
+
+        {/* Nav items — only show when ready */}
+        {isReady && step === "results" && (
+          <div style={{ display: "flex", gap: 0, marginLeft: 4 }}>
+            {[
+              { id: "cover", label: "Cover Letter" },
+              { id: "resume", label: "Resume" },
+              { id: "market", label: "Market Intel" },
+            ].map(tab => (
+              <button
+                key={tab.id}
+                onClick={() => setActiveTab(tab.id)}
+                style={{
+                  padding: "6px 14px", fontSize: 13, fontFamily: T.font, border: "none",
+                  background: "transparent", cursor: "pointer",
+                  color: activeTab === tab.id ? T.accentInk : T.textMuted,
+                  fontWeight: activeTab === tab.id ? 600 : 400,
+                }}
+              >
+                {tab.label}
+              </button>
+            ))}
+          </div>
+        )}
+
+        {/* Right side */}
+        <div style={{ marginLeft: "auto", display: "flex", alignItems: "center", gap: 8 }}>
+          {/* Theme toggle — Ledger pattern */}
+          <button
+            onClick={() => setTheme(theme === "dark" ? "light" : "dark")}
+            title={theme === "dark" ? "Switch to light mode" : "Switch to dark mode"}
+            style={{
+              display: "flex", alignItems: "center", gap: 9,
+              background: "transparent", border: "none", cursor: "pointer",
+              padding: "4px 2px", fontFamily: T.font,
+            }}
+          >
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none"
+              stroke={T.textMuted} strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"
+              style={{ display: "block", flex: "0 0 auto" }}>
+              <circle cx="12" cy="12" r="4" />
+              <path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4" />
+            </svg>
+            <span style={{
+              position: "relative", width: 40, height: 22, borderRadius: 11,
+              background: theme === "dark" ? T.accentInk : T.bgInput,
+              border: "1px solid " + T.border, transition: "background .15s",
+              flex: "0 0 auto", display: "inline-block",
+            }}>
+              <span style={{
+                position: "absolute", top: 2,
+                left: theme === "dark" ? 19 : 2,
+                width: 16, height: 16, borderRadius: "50%",
+                background: theme === "dark" ? "#fff" : T.textBright,
+                transition: "left .15s",
+              }} />
+            </span>
+            <span style={{ fontSize: 13, fontWeight: 600, color: T.textSecondary }}>
+              Dark mode
+            </span>
+          </button>
+
+          {/* Settings */}
+          {isReady && (
+            <button
+              onClick={() => setShowSettings(true)}
+              style={{
+                fontFamily: T.font, fontSize: 12, fontWeight: 600, cursor: "pointer",
+                color: T.textMuted, background: "transparent",
+                border: "1px solid " + T.border, padding: "5px 10px", borderRadius: 7,
+              }}
+            >
+              Settings
+            </button>
+          )}
+
+          {/* New analysis */}
+          {step === "results" && (
+            <button
+              onClick={reset}
+              style={{
+                fontFamily: T.font, fontSize: 12, fontWeight: 600, cursor: "pointer",
+                color: T.textMuted, background: "transparent",
+                border: "1px solid " + T.border, padding: "5px 10px", borderRadius: 7,
+              }}
+            >
+              New analysis
+            </button>
+          )}
+        </div>
+      </div>
+
+      {/* ── ABOUT MODAL ─────────────────────────────────────────────── */}
+      {showAbout && (
+        <div style={{
+          position: "fixed", inset: 0, zIndex: 999,
+          background: "rgba(0,0,0,0.45)", display: "flex",
+          alignItems: "center", justifyContent: "center",
+        }} onClick={() => setShowAbout(false)}>
+          <div style={{
+            background: T.bgCard, borderRadius: 12, padding: "28px 32px",
+            maxWidth: 520, width: "90%", boxShadow: T.shadowHover,
+            border: "1px solid " + T.border,
+          }} onClick={e => e.stopPropagation()}>
+            <div style={{ fontSize: 16, fontWeight: 700, color: T.textBright, marginBottom: 12 }}>
+              Tailor
+            </div>
+            <div style={{ fontSize: 13, color: T.text, lineHeight: 1.7 }}>
+              Tailor helps job applicants position their experience for specific roles. Paste a job description and your resume, and Tailor will generate a tailored cover letter, resume optimization suggestions, and interview talking points.
+            </div>
+            <div style={{ fontSize: 13, color: T.text, lineHeight: 1.7, marginTop: 12 }}>
+              What makes it different is the market intelligence layer. Tailor draws on data from Meridian, which tracks thousands of active job postings across UX Research, UX Design, and Product Management. It knows which methods, skills, and signals employers actually ask for at each seniority level, and uses that context to shape your application.
+            </div>
+            <div style={{ marginTop: 20, textAlign: "right" }}>
+              <Btn primary onClick={() => setShowAbout(false)} T={T}>Got it</Btn>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ── SETTINGS MODAL ──────────────────────────────────────────── */}
+      {showSettings && (
+        <div style={{
+          position: "fixed", inset: 0, zIndex: 999,
+          background: "rgba(0,0,0,0.45)", display: "flex",
+          alignItems: "center", justifyContent: "center",
+        }} onClick={() => setShowSettings(false)}>
+          <div style={{
+            background: T.bgCard, borderRadius: 12, padding: "28px 32px",
+            maxWidth: 480, width: "90%", boxShadow: T.shadowHover,
+            border: "1px solid " + T.border,
+          }} onClick={e => e.stopPropagation()}>
+            <div style={{ fontSize: 16, fontWeight: 700, color: T.textBright, marginBottom: 20 }}>
+              Settings
+            </div>
+
+            <div style={{ marginBottom: 20 }}>
+              <SectionLabel T={T}>Resume</SectionLabel>
+              <UploadZone
+                accept=".docx,.pdf"
+                label="Upload resume"
+                hint=".docx or .pdf"
+                fileName={resumeFileName}
+                onFile={handleResumeFile}
+                onClear={clearResume}
+                extracting={extracting}
+                error={null}
+                T={T}
+              />
+              {resumeText && (
+                <div style={{ fontSize: 11, color: T.textDim, marginTop: 4 }}>
+                  {resumeText.split(/\s+/).filter(Boolean).length} words extracted
+                  {profileLoading && " \u00B7 analyzing profile..."}
+                  {profile && !profileLoading && " \u00B7 profile ready"}
+                </div>
+              )}
+            </div>
+
+            <div style={{ marginBottom: 20 }}>
+              <SectionLabel T={T}>Voice profile</SectionLabel>
+              <UploadZone
+                accept=".docx,.md,.txt"
+                label="Upload voice profile"
+                hint=".docx or .md"
+                fileName={voiceFileName}
+                onFile={handleVoiceFile}
+                onClear={clearVoice}
+                extracting={extracting}
+                error={null}
+                T={T}
+              />
+              {voiceText && (
+                <div style={{ fontSize: 11, color: T.textDim, marginTop: 4 }}>
+                  {voiceText.split(/\s+/).filter(Boolean).length} words extracted
+                  {voiceLoading && " \u00B7 summarizing style..."}
+                  {voiceSummary && !voiceLoading && " \u00B7 style captured"}
+                </div>
+              )}
+              {!voiceFileName && (
+                <div style={{ fontSize: 11, color: T.textDim, marginTop: 4 }}>
+                  Optional. When provided, the cover letter will match this writing style.
+                </div>
+              )}
+            </div>
+
+            <div style={{ textAlign: "right" }}>
+              <Btn primary onClick={() => setShowSettings(false)} T={T}>Done</Btn>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ── BODY ────────────────────────────────────────────────────── */}
+      <div style={{ maxWidth: 960, margin: "0 auto", padding: "24px 24px" }}>
+
+        {/* ── SETUP WIZARD ────────────────────────────────────────── */}
+        {!isReady && (
+          <div style={{ maxWidth: 480, margin: "0 auto" }}>
+            {/* Step indicators */}
+            <div style={{ display: "flex", alignItems: "center", gap: 0, marginBottom: 32 }}>
+              {[
+                { n: 1, label: "Add resume" },
+                { n: 2, label: "Voice profile" },
+                { n: 3, label: "Tailor" },
+              ].map((s, i) => {
+                const done = s.n < stepNumber;
+                const active = s.n === stepNumber;
+                return (
+                  <div key={s.n} style={{ display: "flex", alignItems: "center", flex: i < 2 ? 1 : "none" }}>
+                    <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                      <div style={{
+                        width: 28, height: 28, borderRadius: "50%", flexShrink: 0,
+                        display: "flex", alignItems: "center", justifyContent: "center",
+                        fontSize: 12, fontWeight: 700,
+                        background: done ? T.success : active ? T.accent : T.bgInput,
+                        color: done || active ? "#fff" : T.textMuted,
+                        border: "1px solid " + (done ? T.success : active ? T.accent : T.borderStrong),
+                      }}>
+                        {done ? "\u2713" : s.n}
+                      </div>
+                      <span style={{
+                        fontSize: 12, fontWeight: active ? 600 : 400,
+                        color: active ? T.textBright : T.textMuted,
+                        whiteSpace: "nowrap",
+                      }}>
+                        {s.label}
+                      </span>
+                    </div>
+                    {i < 2 && (
+                      <div style={{
+                        flex: 1, height: 1, margin: "0 12px",
+                        background: done ? T.success : T.borderStrong,
+                      }} />
+                    )}
+                  </div>
+                );
+              })}
+            </div>
+
+            {/* Step 1: Resume */}
+            {setupStep === "resume" && (
+              <div>
+                <Card T={T} style={{ marginBottom: profile || profileLoading || profileError ? 16 : 0 }}>
+                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 4, flexWrap: "wrap", gap: 8 }}>
+                    <div style={{ fontSize: 15, fontWeight: 600, color: T.textBright }}>
+                      Add your resume
+                    </div>
+                    <button
+                      onClick={() => { setResumePasteMode(m => !m); setFileError(null); }}
+                      style={{
+                        background: "none", border: "none", color: T.accentInk, cursor: "pointer",
+                        fontSize: 12, fontWeight: 600, fontFamily: T.font,
+                      }}
+                    >
+                      {resumePasteMode ? "Upload a file instead" : "Paste text instead"}
+                    </button>
+                  </div>
+                  <div style={{ fontSize: 13, color: T.textMuted, marginBottom: 16, lineHeight: 1.6 }}>
+                    Tailor reads your resume and assesses it across the same dimensions the market tracks. This stays local and is only used to generate tailored application materials.
+                  </div>
+
+                  {resumePasteMode ? (
+                    <div>
+                      <TextArea
+                        value={resumePaste}
+                        onChange={setResumePaste}
+                        T={T}
+                        rows={12}
+                        placeholder={"Paste your resume text here.\n\nInclude your roles, skills, methods, tools, education, and notable projects or outcomes."}
+                      />
+                      {fileError && <div style={{ fontSize: 12, color: T.danger, marginTop: 6 }}>{fileError}</div>}
+                      <div style={{ marginTop: 12 }}>
+                        <Btn primary onClick={submitResumePaste} disabled={profileLoading || resumePaste.trim().length < 20} T={T}>
+                          {profileLoading ? "Analyzing..." : "Use this resume"}
+                        </Btn>
+                      </div>
+                    </div>
+                  ) : (
+                    <UploadZone
+                      accept=".docx,.pdf"
+                      label="Drop your resume here, or click to browse"
+                      hint="Accepts .docx and .pdf"
+                      fileName={resumeFileName}
+                      onFile={handleResumeFile}
+                      onClear={clearResume}
+                      extracting={extracting}
+                      error={fileError}
+                      T={T}
+                    />
+                  )}
+                </Card>
+
+                {/* ATS readiness — deterministic, shown as soon as text exists */}
+                {atsResult && (
+                  <AtsReport result={atsResult} T={T} />
+                )}
+
+                {/* AI profile — appears when it arrives, doesn't block anything */}
+                {(profile || profileLoading || profileError) && (
+                  <ResumeProfile
+                    profile={profile}
+                    loading={profileLoading}
+                    error={profileError}
+                    discipline={discipline}
+                    T={T}
+                    collapsedByDefault={false}
+                  />
+                )}
+
+                {/* Advance as soon as resume text exists */}
+                {resumeText && (
+                  <div style={{ textAlign: "right" }}>
+                    <Btn primary onClick={() => setSetupStep("voice")} T={T}>
+                      Continue to voice profile {"\u2192"}
+                    </Btn>
+                  </div>
+                )}
+              </div>
+            )}
+
+            {/* Step 2: Voice profile */}
+            {setupStep === "voice" && (
+              <div>
+                <Card T={T} style={{ marginBottom: voiceSummary || voiceLoading || voiceError ? 16 : 0 }}>
+                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 4, flexWrap: "wrap", gap: 8 }}>
+                    <div style={{ fontSize: 15, fontWeight: 600, color: T.textBright }}>
+                      Add a voice profile
+                    </div>
+                    <button
+                      onClick={() => { setVoicePasteMode(m => !m); setFileError(null); }}
+                      style={{
+                        background: "none", border: "none", color: T.accentInk, cursor: "pointer",
+                        fontSize: 12, fontWeight: 600, fontFamily: T.font,
+                      }}
+                    >
+                      {voicePasteMode ? "Upload a file instead" : "Paste text instead"}
+                    </button>
+                  </div>
+                  <div style={{ fontSize: 13, color: T.textMuted, marginBottom: 16, lineHeight: 1.6 }}>
+                    A voice profile describes your writing style, tone, and preferences. When provided, the cover letter Tailor generates will match how you actually write. You can skip this and add one later in Settings.
+                  </div>
+
+                  {voicePasteMode ? (
+                    <div>
+                      <TextArea
+                        value={voicePaste}
+                        onChange={setVoicePaste}
+                        T={T}
+                        rows={10}
+                        placeholder={"Paste your voice profile, or a few paragraphs of your own writing that show your style."}
+                      />
+                      {fileError && <div style={{ fontSize: 12, color: T.danger, marginTop: 6 }}>{fileError}</div>}
+                      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginTop: 12 }}>
+                        <button
+                          onClick={skipVoice}
+                          style={{
+                            background: "none", border: "none", color: T.textMuted, cursor: "pointer",
+                            fontSize: 13, fontFamily: T.font, textDecoration: "underline",
+                          }}
+                        >
+                          Skip for now
+                        </button>
+                        <Btn primary onClick={submitVoicePaste} disabled={voiceLoading || voicePaste.trim().length < 10} T={T}>
+                          {voiceLoading ? "Analyzing..." : "Use this profile"}
+                        </Btn>
+                      </div>
+                    </div>
+                  ) : (
+                    <div>
+                      <UploadZone
+                        accept=".docx,.md,.txt"
+                        label="Drop your voice profile here, or click to browse"
+                        hint="Accepts .docx and .md"
+                        fileName={voiceFileName}
+                        onFile={handleVoiceFile}
+                        onClear={clearVoice}
+                        extracting={extracting}
+                        error={fileError}
+                        T={T}
+                      />
+                      {!voiceFileName && !voiceLoading && (
+                        <div style={{ marginTop: 16, textAlign: "right" }}>
+                          <button
+                            onClick={skipVoice}
+                            style={{
+                              background: "none", border: "none", color: T.textMuted, cursor: "pointer",
+                              fontSize: 13, fontFamily: T.font, textDecoration: "underline",
+                            }}
+                          >
+                            Skip for now
+                          </button>
+                        </div>
+                      )}
+                    </div>
+                  )}
+                </Card>
+
+                {/* Writing style summary — appears when it arrives */}
+                <VoiceSummary
+                  summary={voiceSummary}
+                  loading={voiceLoading}
+                  error={voiceError}
+                  T={T}
+                />
+
+                {/* Advance as soon as voice text exists */}
+                {voiceText && (
+                  <div style={{ textAlign: "right" }}>
+                    <Btn primary onClick={() => setSetupStep("ready")} T={T}>
+                      Next {"\u2192"}
+                    </Btn>
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* ── MAIN INPUT (after setup) ────────────────────────────── */}
+        {isReady && step === "input" && (
+          <div>
+            {error && (
+              <Card T={T} style={{ marginBottom: 16, borderColor: T.danger + "44" }}>
+                <div style={{ color: T.danger, fontSize: 13 }}>{error}</div>
+              </Card>
+            )}
+
+            {/* Resume profile across Meridian dimensions */}
+            <ResumeProfile
+              profile={profile}
+              loading={profileLoading}
+              error={profileError}
+              discipline={discipline}
+              T={T}
+              collapsedByDefault={false}
+            />
+
+            {/* Auto-detected chips — only show when enough text */}
+            {jobText.length > 50 && (
+              <div style={{ display: "flex", gap: 10, marginBottom: 18, alignItems: "center" }}>
+                <span style={{
+                  padding: "5px 12px", borderRadius: 6, fontSize: 12, fontWeight: 600,
+                  background: T.accentSoft, color: T.accentInk,
+                  border: "1px solid " + T.accent + "33",
+                }}>
+                  {MARKET_INTEL[discipline]?.label || "UX Research"}
+                </span>
+                <span style={{
+                  padding: "5px 12px", borderRadius: 6, fontSize: 12, fontWeight: 500,
+                  background: T.bgInput, color: T.textSecondary,
+                  border: "1px solid " + T.borderStrong,
+                }}>
+                  {seniority}
+                </span>
+                <span style={{ fontSize: 11, color: T.textDim }}>
+                  Auto-detected from job description
+                </span>
+              </div>
+            )}
+
+            <SectionLabel T={T}>Job description</SectionLabel>
+            <TextArea
+              value={jobText} onChange={setJobText} T={T} rows={14}
+              placeholder={"Paste the full job description here.\n\nTailor will identify the role\u2019s discipline, seniority level, and key requirements, then cross-reference them against current market data from Meridian."}
+            />
+            {jobText.length > 0 && (
+              <div style={{ fontSize: 11, color: T.textDim, marginTop: 5 }}>
+                {jobText.split(/\s+/).filter(Boolean).length} words
+              </div>
+            )}
+
+            <div style={{ display: "flex", justifyContent: "center", flexDirection: "column", alignItems: "center", gap: 8, marginTop: 20 }}>
+              <Btn primary onClick={analyze} disabled={!canAnalyze} T={T}>
+                Analyze &amp; Tailor
+              </Btn>
+              {!canAnalyze && jobText.length > 0 && (
+                <div style={{ fontSize: 12, color: T.textDim }}>
+                  Add more content to continue
+                </div>
+              )}
+            </div>
+          </div>
+        )}
+
+        {/* LOADING */}
+        {isReady && step === "loading" && <LoadingView discipline={discipline} T={T} />}
+
+        {/* RESULTS */}
+        {isReady && step === "results" && results && (
+          <div>
+            {results.position_strength && (
+              <Card T={T} style={{ marginBottom: 24, borderColor: T.accent + "33", background: T.accentSoft }}>
+                <div style={{ display: "flex", gap: 12, alignItems: "flex-start" }}>
+                  <span style={{ fontSize: 16, color: T.accentInk, marginTop: 1 }}>{"\u25CE"}</span>
+                  <div>
+                    <div style={{
+                      fontSize: 10, color: T.accentInk, textTransform: "uppercase",
+                      letterSpacing: "0.06em", fontWeight: 600, marginBottom: 4,
+                    }}>
+                      Your strongest angle
+                    </div>
+                    <div style={{ fontSize: 14, color: T.textBright, lineHeight: 1.5 }}>
+                      {results.position_strength}
+                    </div>
+                  </div>
+                </div>
+              </Card>
+            )}
+
+            {activeTab === "cover" && <CoverLetterTab coverLetter={results.cover_letter} onRegenerate={regenerateCoverLetter} regenerating={regenerating} T={T} />}
+            {activeTab === "resume" && <ResumeTab suggestions={results.suggestions} talkingPoints={results.talking_points} resumeText={resumeText} onReword={rewordSuggestion} rewordingIdx={rewordingIdx} atsResult={atsResult} T={T} />}
+            {activeTab === "market" && <MarketIntelTab discipline={discipline} seniority={seniority} jobText={jobText} jobDims={jobDims} jobDimsLoading={jobDimsLoading} jobDimsError={jobDimsError} T={T} />}
+          </div>
+        )}
+      </div>
+
+      {/* ── FOOTER ──────────────────────────────────────────────────── */}
+      <div style={{
+        padding: "20px 24px", borderTop: "1px solid " + T.border,
+        textAlign: "center", fontSize: 11, color: T.textDim, marginTop: 40,
+      }}>
+        Tailor {"\u00B7"} A Polite Robot tool {"\u00B7"} {"\u00A9"} {new Date().getFullYear()} Polite Robot
+      </div>
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(<Tailor />);
+
+</script>
+</body>
+</html>
