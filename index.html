@@ -652,6 +652,14 @@ const MARKET_INTEL = {
     ],
     emergingSignals: ["AI product research", "Agentic AI", "Research operations", "Research democratization", "AI-augmented workflows"],
     degreeRate: 58,
+    topTools: [
+      { name: "UserTesting / UserZoom", pct: 42 },
+      { name: "Qualtrics", pct: 38 },
+      { name: "Dovetail", pct: 32 },
+      { name: "Figma", pct: 28 },
+      { name: "Miro / FigJam", pct: 25 },
+      { name: "Amplitude / Pendo", pct: 22 },
+    ],
   },
   design: {
     label: "UX Design",
@@ -687,6 +695,14 @@ const MARKET_INTEL = {
     ],
     emergingSignals: ["AI-native interaction patterns", "Prompt UX", "Generative design tools", "Conversational UI", "Multimodal interfaces"],
     degreeRate: 48,
+    topTools: [
+      { name: "Figma", pct: 82 },
+      { name: "Adobe Creative Suite", pct: 38 },
+      { name: "Sketch", pct: 22 },
+      { name: "Miro / FigJam", pct: 30 },
+      { name: "Principle / ProtoPie", pct: 18 },
+      { name: "Storybook", pct: 15 },
+    ],
   },
   pm: {
     label: "Product Management",
@@ -723,6 +739,14 @@ const MARKET_INTEL = {
     ],
     emergingSignals: ["AI product strategy", "Agentic product design", "LLM-powered features", "AI safety considerations", "Model evaluation"],
     degreeRate: 52,
+    topTools: [
+      { name: "Jira / Confluence", pct: 62 },
+      { name: "Amplitude / Mixpanel", pct: 45 },
+      { name: "Figma", pct: 32 },
+      { name: "SQL / data querying", pct: 28 },
+      { name: "Tableau / Looker", pct: 22 },
+      { name: "Aha! / Productboard", pct: 18 },
+    ],
   },
 };
 
@@ -2065,6 +2089,11 @@ function ResumeProfile({ profile, loading, error, discipline, T, collapsedByDefa
   const intel = MARKET_INTEL[profile.discipline] || MARKET_INTEL[discipline];
   const methodCov = intel ? coverage(profile.methods, intel.topMethods) : null;
   const skillCov = intel ? coverage(profile.soft_skills, intel.topSoftSkills) : null;
+  const toolCov = intel && intel.topTools ? coverage(profile.tools, intel.topTools) : null;
+  const signalCov = intel ? coverage(
+    (profile.specializations || []).concat(profile.methods || []).concat(profile.ai_experience ? ["AI"] : []),
+    intel.emergingSignals.map((s, i) => ({ name: s, pct: 0 }))
+  ) : null;
 
   return (
     <Card T={T} style={{ marginBottom: 20 }}>
@@ -2142,25 +2171,105 @@ function ResumeProfile({ profile, loading, error, discipline, T, collapsedByDefa
             </ProfileField>
           )}
 
-          {/* Deterministic market coverage */}
+          {/* Deterministic market coverage — multi-dimension */}
           {intel && methodCov && (
             <div style={{ marginTop: 20, paddingTop: 18, borderTop: "1px solid " + T.border }}>
               <div style={{ fontSize: 10, color: T.textMuted, textTransform: "uppercase", letterSpacing: "0.06em", fontWeight: 600, marginBottom: 4 }}>
-                Coverage against {intel.label} market
+                Your resume vs. {intel.label} postings (all levels)
               </div>
-              <div style={{ fontSize: 13, color: T.textBright, marginBottom: 6 }}>
-                You have <strong style={{ color: T.accentInk }}>{methodCov.matched.length} of {intel.topMethods.length}</strong> of the most-requested methods
-                {skillCov && <> and <strong style={{ color: T.accentInk }}>{skillCov.matched.length} of {intel.topSoftSkills.length}</strong> top soft skills</>}.
-              </div>
-              <div style={{ fontSize: 11, color: T.textDim, marginBottom: 16 }}>
-                Checked items appear in your resume. Percentages show how often each is requested in postings.
+              <div style={{ fontSize: 11, color: T.textDim, marginBottom: 16, lineHeight: 1.5 }}>
+                Compared against the dimensions Meridian tracks across all active {intel.label} postings. Checked items appear in your resume. Percentages show how often each is requested.
+                {profile.seniority && " Your profile reads as " + profile.seniority + "-level; the method and skill frequencies below reflect the full market, not a single level, since most postings require the same core set regardless of seniority."}
               </div>
 
+              {/* Summary row */}
+              <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: 12, marginBottom: 20 }}>
+                <div style={{ background: T.bgSubtle, borderRadius: 8, padding: "12px 14px", textAlign: "center" }}>
+                  <div style={{ fontSize: 18, fontWeight: 700, color: methodCov.matched.length >= intel.topMethods.length / 2 ? T.success : T.warning }}>
+                    {methodCov.matched.length}/{intel.topMethods.length}
+                  </div>
+                  <div style={{ fontSize: 10, color: T.textMuted, marginTop: 2 }}>Methods</div>
+                </div>
+                {skillCov && (
+                  <div style={{ background: T.bgSubtle, borderRadius: 8, padding: "12px 14px", textAlign: "center" }}>
+                    <div style={{ fontSize: 18, fontWeight: 700, color: skillCov.matched.length >= intel.topSoftSkills.length / 2 ? T.success : T.warning }}>
+                      {skillCov.matched.length}/{intel.topSoftSkills.length}
+                    </div>
+                    <div style={{ fontSize: 10, color: T.textMuted, marginTop: 2 }}>Soft skills</div>
+                  </div>
+                )}
+                {toolCov && (
+                  <div style={{ background: T.bgSubtle, borderRadius: 8, padding: "12px 14px", textAlign: "center" }}>
+                    <div style={{ fontSize: 18, fontWeight: 700, color: toolCov.matched.length >= intel.topTools.length / 2 ? T.success : T.warning }}>
+                      {toolCov.matched.length}/{intel.topTools.length}
+                    </div>
+                    <div style={{ fontSize: 10, color: T.textMuted, marginTop: 2 }}>Tools</div>
+                  </div>
+                )}
+                <div style={{ background: T.bgSubtle, borderRadius: 8, padding: "12px 14px", textAlign: "center" }}>
+                  <div style={{ fontSize: 18, fontWeight: 700, color: profile.ai_experience ? T.success : (intel.aiMentionRate > 40 ? T.warning : T.textBright) }}>
+                    {profile.ai_experience ? "Yes" : "No"}
+                  </div>
+                  <div style={{ fontSize: 10, color: T.textMuted, marginTop: 2 }}>AI exp ({intel.aiMentionRate}% ask)</div>
+                </div>
+              </div>
+
+              {/* Degree and emerging signals row */}
+              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12, marginBottom: 20 }}>
+                <div style={{ background: T.bgSubtle, borderRadius: 8, padding: "12px 14px" }}>
+                  <div style={{ fontSize: 10, color: T.textMuted, textTransform: "uppercase", letterSpacing: "0.06em", fontWeight: 600, marginBottom: 6 }}>
+                    Degree
+                  </div>
+                  <div style={{ fontSize: 13, color: T.textBright }}>
+                    You have: <strong>{profile.degree_level || "Not stated"}</strong>
+                    {profile.degree_field && <span style={{ color: T.textMuted }}> ({profile.degree_field})</span>}
+                  </div>
+                  <div style={{ fontSize: 11, color: T.textDim, marginTop: 4 }}>
+                    {intel.degreeRate}% of {intel.label} postings require a degree.
+                    {profile.degree_level && profile.degree_level !== "None stated"
+                      ? " Your resume shows one, which meets this requirement."
+                      : " If you have a degree, make sure it is stated on your resume."}
+                  </div>
+                </div>
+                {signalCov && (
+                  <div style={{ background: T.bgSubtle, borderRadius: 8, padding: "12px 14px" }}>
+                    <div style={{ fontSize: 10, color: T.textMuted, textTransform: "uppercase", letterSpacing: "0.06em", fontWeight: 600, marginBottom: 6 }}>
+                      Emerging signals
+                    </div>
+                    <div style={{ fontSize: 13, color: T.textBright, marginBottom: 6 }}>
+                      You touch <strong style={{ color: signalCov.matched.length > 0 ? T.accentInk : T.warning }}>{signalCov.matched.length}</strong> of {intel.emergingSignals.length} emerging areas
+                    </div>
+                    <div style={{ display: "flex", flexWrap: "wrap", gap: 5 }}>
+                      {intel.emergingSignals.map((sig, i) => {
+                        const hit = signalCov.items[i] && signalCov.items[i].hit;
+                        return (
+                          <span key={i} style={{
+                            padding: "3px 8px", fontSize: 11, borderRadius: 5,
+                            background: hit ? T.accentSoft : T.bgInput,
+                            color: hit ? T.accentInk : T.textDim,
+                            border: "1px solid " + (hit ? T.accent + "33" : T.borderStrong),
+                            fontWeight: hit ? 600 : 400,
+                          }}>
+                            {sig}
+                          </span>
+                        );
+                      })}
+                    </div>
+                  </div>
+                )}
+              </div>
+
+              {/* Detailed checklists */}
               <div style={{ marginBottom: 20 }}>
                 <CoverageList title="Most-requested methods" items={methodCov.items} T={T} />
               </div>
               {skillCov && (
-                <CoverageList title="Most-requested soft skills" items={skillCov.items} T={T} />
+                <div style={{ marginBottom: 20 }}>
+                  <CoverageList title="Most-requested soft skills" items={skillCov.items} T={T} />
+                </div>
+              )}
+              {toolCov && (
+                <CoverageList title="Most-requested tools" items={toolCov.items} T={T} />
               )}
             </div>
           )}
