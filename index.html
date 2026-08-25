@@ -866,6 +866,39 @@ function detectSeniority(text) {
   return "Mid";
 }
 
+// Deterministic salary extraction — runs on the FULL text, no truncation.
+// Salary ranges in postings follow predictable patterns; there is no reason
+// to make the AI guess at a number that a regex can read reliably.
+function extractSalaryFromText(text) {
+  if (!text) return null;
+  // Match patterns like: $113,100 to $232,300 / $113K-$232K / $113,100 - $232,300
+  const patterns = [
+    // $NNN,NNN to/- $NNN,NNN
+    /\$\s*([\d,]+)\s*(?:to|[-\u2013\u2014])\s*\$\s*([\d,]+)/gi,
+    // $NNNK to/- $NNNK
+    /\$\s*([\d.]+)\s*[Kk]\s*(?:to|[-\u2013\u2014])\s*\$\s*([\d.]+)\s*[Kk]/gi,
+  ];
+  const results = [];
+  for (const re of patterns) {
+    let m;
+    while ((m = re.exec(text)) !== null) {
+      let low = parseFloat(m[1].replace(/,/g, ""));
+      let high = parseFloat(m[2].replace(/,/g, ""));
+      // Handle K notation
+      if (low < 1000 && m[0].toLowerCase().includes("k")) low *= 1000;
+      if (high < 1000 && m[0].toLowerCase().includes("k")) high *= 1000;
+      if (low > 20000 && high > 20000 && high >= low) {
+        results.push({ min: low, max: high });
+      }
+    }
+  }
+  // If multiple ranges found, take the one most likely to be the base salary
+  // (the largest range, which is usually the annual comp, not a bonus or hourly).
+  if (results.length === 0) return null;
+  results.sort((a, b) => (b.max - b.min) - (a.max - a.min));
+  return results[0];
+}
+
 // ─── SHARED COMPONENTS ─────────────────────────────────────────────────────
 
 function Card({ children, style, T }) {
@@ -1084,10 +1117,281 @@ function ExportButtons({ title, text, T }) {
   );
 }
 
+// ─── RESUME CUSTOMIZATION (deterministic — no AI) ───────────────────────────
+// Compares the specific job posting's requirements against the resume's content
+// and produces targeted editing recommendations: keywords to mirror, experience
+// to reframe, and sections to add or strengthen.
+function buildResumeCustomizations(profile, jobText, resumeText, intel) {
+  if (!profile || !jobText || !resumeText || !intel) return null;
+  const jobLower = (jobText || "").toLowerCase();
+  const resumeLower = (resumeText || "").toLowerCase();
+  const norm = (s) => (s || "").toLowerCase().replace(/[^a-z0-9 ]/g, "").trim();
+
+  const customizations = [];
+
+  // 1. Keywords the posting uses that the resume doesn't — literal term mirroring.
+  // ATS systems match exact terms, so "user interviews" in the posting needs
+  // "user interviews" in the resume, not "talking to customers."
+  const stop = new Set("the and for with you your our this that will able have has are was were from they their there job role work team years experience including etc a an of to in on at as be or by is it we us who all any can may more most other such using across within into over about than then them these those which while would should could must been also each both its with the".split(/\s+/));
+
+  // Extract distinctive multi-word phrases from the job posting (2-3 word combos)
+  const jobWords = jobLower.match(/[a-z][a-z'-]{2,}/g) || [];
+  const jobBigrams = [];
+  for (let i = 0; i < jobWords.length - 1; i++) {
+    if (!stop.has(jobWords[i]) && !stop.has(jobWords[i + 1])) {
+      jobBigrams.push(jobWords[i] + " " + jobWords[i + 1]);
+    }
+  }
+  // Count frequency of each bigram
+  const bigramFreq = {};
+  jobBigrams.forEach(b => { bigramFreq[b] = (bigramFreq[b] || 0) + 1; });
+  // Find bigrams that appear 2+ times in the posting but not in the resume
+  const missingKeyPhrases = Object.keys(bigramFreq)
+    .filter(b => bigramFreq[b] >= 2 && !resumeLower.includes(b))
+    .sort((a, b) => bigramFreq[b] - bigramFreq[a])
+    .slice(0, 8);
+
+  if (missingKeyPhrases.length > 0) {
+    customizations.push({
+      type: "keywords",
+      title: "Mirror these exact phrases from the posting",
+      detail: "ATS keyword matching is literal. These phrases appear multiple times in the posting but are absent from your resume. Use the exact wording where it honestly describes your work.",
+      items: missingKeyPhrases,
+    });
+  }
+
+  // 2. Methods/skills the posting asks for that are in your profile but missing
+  // from your resume text — the experience exists but isn't stated.
+  const inProfileNotResume = (profile.methods || []).concat(profile.tools || []).filter(item => {
+    const itemLower = item.toLowerCase();
+    const inJob = jobLower.includes(itemLower);
+    const inResume = resumeLower.includes(itemLower);
+    return inJob && !inResume;
+  });
+
+  if (inProfileNotResume.length > 0) {
+    customizations.push({
+      type: "unstated",
+      title: "Experience you have but your resume doesn't show",
+      detail: "Your profile analysis detected these, and this posting asks for them, but the exact terms don't appear in your resume text. Add them explicitly.",
+      items: inProfileNotResume,
+    });
+  }
+
+  // 3. Methods/skills the posting asks for that are NOT in your profile at all.
+  const trueGaps = intel.topMethods.concat(intel.topSoftSkills).filter(m => {
+    const mLower = m.name.toLowerCase();
+    if (!jobLower.includes(mLower)) return false;
+    const inProfile = (profile.methods || []).concat(profile.soft_skills || []).concat(profile.tools || [])
+      .some(p => p.toLowerCase().includes(mLower) || mLower.includes(p.toLowerCase()));
+    return !inProfile;
+  });
+
+  if (trueGaps.length > 0) {
+    customizations.push({
+      type: "gaps",
+      title: "This posting requires these — consider whether you can speak to them",
+      detail: "These appear in the posting and in the market's most-requested list, but weren't found in your resume or profile. Only add them if you can do so honestly. Adjacent experience counts.",
+      items: trueGaps.map(g => g.name + " (" + g.pct + "% of postings)"),
+    });
+  }
+
+  // 4. Section recommendations based on what the posting emphasizes.
+  const sectionRecs = [];
+
+  // Does the posting emphasize leadership/mentoring but the resume lacks a clear
+  // leadership section or leadership bullets?
+  if ((jobLower.includes("mentor") || jobLower.includes("lead") || jobLower.includes("manage")) &&
+      !resumeLower.includes("mentor") && !resumeLower.includes("managed a team") && !resumeLower.includes("led a team")) {
+    sectionRecs.push("Add leadership and mentoring outcomes to your most recent role — team size, people developed, practices you established.");
+  }
+
+  // Does the posting mention stakeholders/cross-functional but the resume doesn't?
+  if ((jobLower.includes("stakeholder") || jobLower.includes("cross-functional")) &&
+      !resumeLower.includes("stakeholder") && !resumeLower.includes("cross-functional")) {
+    sectionRecs.push("Add cross-functional collaboration examples — name the teams you partnered with (product, design, engineering) and the outcomes.");
+  }
+
+  // Does the posting mention metrics/data/analytics but the resume is light on numbers?
+  const numberCount = (resumeText.match(/\d+[%+Kk]|\d{2,}/g) || []).length;
+  if ((jobLower.includes("metric") || jobLower.includes("analytics") || jobLower.includes("data")) && numberCount < 5) {
+    sectionRecs.push("Quantify more of your impact — this posting emphasizes metrics and data. Add numbers: study counts, participant numbers, adoption rates, team sizes.");
+  }
+
+  // Does it mention a skills section requirement but the resume lacks one?
+  if (!resumeLower.includes("skills") && !resumeLower.includes("competencies")) {
+    sectionRecs.push("Add a dedicated Skills section listing methods, tools, and domain expertise as comma-separated terms. This is the highest-value ATS keyword block.");
+  }
+
+  if (sectionRecs.length > 0) {
+    customizations.push({
+      type: "sections",
+      title: "Structural recommendations for this posting",
+      detail: "Based on what this posting emphasizes and what your resume's structure is missing.",
+      items: sectionRecs,
+    });
+  }
+
+  return customizations.length > 0 ? customizations : null;
+}
+
+// ─── POSITIONING STRATEGY TAB ───────────────────────────────────────────────
+function PositioningTab({ strategy, positionStrength, talkingPoints, T }) {
+  if (!strategy) return <div style={{ color: T.textMuted, fontSize: 13 }}>No positioning analysis available.</div>;
+
+  return (
+    <div>
+      {/* Strongest angle */}
+      {positionStrength && (
+        <Card T={T} style={{ marginBottom: 20, borderColor: T.accent + "33", background: T.accentSoft }}>
+          <div style={{ display: "flex", gap: 12, alignItems: "flex-start" }}>
+            <span style={{ fontSize: 16, color: T.accentInk, marginTop: 1 }}>{"\u25CE"}</span>
+            <div>
+              <div style={{ fontSize: 10, color: T.accentInk, textTransform: "uppercase", letterSpacing: "0.06em", fontWeight: 600, marginBottom: 4 }}>
+                Your strongest angle for this posting
+              </div>
+              <div style={{ fontSize: 14, color: T.textBright, lineHeight: 1.5 }}>
+                {positionStrength}
+              </div>
+            </div>
+          </div>
+        </Card>
+      )}
+
+      {/* Lead with these */}
+      {strategy.leadWith && strategy.leadWith.length > 0 && (
+        <div style={{ marginBottom: 24 }}>
+          <SectionLabel T={T}>Lead with these — your differentiators</SectionLabel>
+          <div style={{ fontSize: 12, color: T.textMuted, marginBottom: 10, lineHeight: 1.5 }}>
+            These are things you have that this posting asks for AND that are not universal in the market. They set you apart from other applicants.
+          </div>
+          {strategy.leadWith.map((item, i) => (
+            <Card key={i} T={T} style={{ marginBottom: 8 }}>
+              <div style={{ display: "flex", gap: 10, alignItems: "flex-start" }}>
+                <span style={{ color: T.success, fontSize: 14, marginTop: 1, flexShrink: 0 }}>{"\u2713"}</span>
+                <div>
+                  <div style={{ fontSize: 13, fontWeight: 600, color: T.textBright }}>{item.method}</div>
+                  <div style={{ fontSize: 12, color: T.textMuted, marginTop: 2 }}>
+                    {item.marketPct > 0
+                      ? "Only " + item.marketPct + "% of postings ask for this — when you mention it, you're speaking to something specific this role wants that most resumes won't address."
+                      : "This isn't in the standard market vocabulary, which means it's specific to this posting. Address it directly."}
+                  </div>
+                </div>
+              </div>
+            </Card>
+          ))}
+        </div>
+      )}
+
+      {/* Market-informed hooks */}
+      {strategy.hooks && strategy.hooks.length > 0 && (
+        <div style={{ marginBottom: 24 }}>
+          <SectionLabel T={T}>Market-informed hooks</SectionLabel>
+          <div style={{ fontSize: 12, color: T.textMuted, marginBottom: 10, lineHeight: 1.5 }}>
+            Angles informed by what Meridian sees across the market that most applicants won't think to use.
+          </div>
+          {strategy.hooks.map((hook, i) => (
+            <Card key={i} T={T} style={{ marginBottom: 8 }}>
+              <div style={{ fontSize: 13, fontWeight: 600, color: T.accentInk, marginBottom: 4 }}>{hook.theme}</div>
+              <div style={{ fontSize: 12, color: T.text, lineHeight: 1.6 }}>{hook.insight}</div>
+            </Card>
+          ))}
+        </div>
+      )}
+
+      {/* Table-stakes — mention but don't dwell */}
+      {strategy.dontOverIndex && strategy.dontOverIndex.length > 0 && (
+        <div style={{ marginBottom: 24 }}>
+          <SectionLabel T={T}>Mention briefly — table-stakes</SectionLabel>
+          <div style={{ fontSize: 12, color: T.textMuted, marginBottom: 10, lineHeight: 1.5 }}>
+            These are expected at this level. Confirm you have them, but don't spend your best real estate proving it.
+          </div>
+          {strategy.dontOverIndex.map((item, i) => (
+            <div key={i} style={{
+              display: "flex", gap: 10, alignItems: "flex-start",
+              padding: "8px 0",
+              borderBottom: i < strategy.dontOverIndex.length - 1 ? "1px solid " + T.border : "none",
+            }}>
+              <span style={{ color: T.textDim, fontSize: 12, marginTop: 2, flexShrink: 0 }}>{"\u2013"}</span>
+              <div>
+                <span style={{ fontSize: 13, color: T.textSecondary, fontWeight: 500 }}>{item.method}</span>
+                <span style={{ fontSize: 12, color: T.textDim, marginLeft: 8 }}>{item.reason}</span>
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {/* Gaps to address */}
+      {strategy.jobMethodGaps && strategy.jobMethodGaps.length > 0 && (
+        <div style={{ marginBottom: 24 }}>
+          <SectionLabel T={T}>Gaps to address honestly</SectionLabel>
+          <div style={{ fontSize: 12, color: T.textMuted, marginBottom: 10, lineHeight: 1.5 }}>
+            This posting asks for these, but they don't appear in your resume. If you have the experience, add it. If you don't, consider whether adjacent experience lets you speak to it credibly.
+          </div>
+          <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
+            {strategy.jobMethodGaps.map((m, i) => (
+              <span key={i} style={{
+                padding: "4px 10px", fontSize: 12, borderRadius: 6,
+                background: T.bgInput, color: T.warning,
+                border: "1px solid " + T.warning + "44",
+              }}>
+                {m.name} ({m.pct}% of postings)
+              </span>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {/* Talking points for interviews */}
+      {talkingPoints && talkingPoints.length > 0 && (
+        <div>
+          <SectionLabel T={T}>Interview talking points</SectionLabel>
+          <div style={{ fontSize: 12, color: T.textMuted, marginBottom: 10, lineHeight: 1.5 }}>
+            If you get the interview, these are the themes worth having stories ready for.
+          </div>
+          <Card T={T}>
+            {talkingPoints.map((tp, i) => (
+              <div key={i} style={{
+                padding: "8px 0",
+                borderBottom: i < talkingPoints.length - 1 ? "1px solid " + T.border : "none",
+                display: "flex", gap: 10, alignItems: "flex-start",
+              }}>
+                <span style={{ color: T.accent, fontSize: 12, marginTop: 2, flexShrink: 0 }}>{"\u2192"}</span>
+                <span style={{ fontSize: 13, color: T.textBright, lineHeight: 1.5 }}>{tp}</span>
+              </div>
+            ))}
+          </Card>
+        </div>
+      )}
+    </div>
+  );
+}
+
 // ─── RESULT TABS ────────────────────────────────────────────────────────────
-function CoverLetterTab({ coverLetter, onRegenerate, regenerating, T }) {
+function CoverLetterTab({ coverLetter, onGenerate, generating, onRegenerate, regenerating, T }) {
   const [editRequest, setEditRequest] = useState("");
-  if (!coverLetter) return <div style={{ color: T.textMuted, fontSize: 13 }}>No cover letter generated.</div>;
+
+  if (!coverLetter && !generating) {
+    return (
+      <Card T={T}>
+        <div style={{ fontSize: 13, color: T.text, lineHeight: 1.6, marginBottom: 14 }}>
+          Want an AI-drafted cover letter based on your positioning strategy? It'll use your resume, the job description, and your voice profile if you uploaded one. Review and personalize it before sending — your own voice is always stronger.
+        </div>
+        <Btn primary onClick={onGenerate} T={T}>
+          Generate cover letter
+        </Btn>
+      </Card>
+    );
+  }
+
+  if (generating) {
+    return (
+      <div style={{ fontSize: 13, color: T.textMuted, padding: "20px 0" }}>
+        Drafting cover letter...
+      </div>
+    );
+  }
 
   return (
     <div>
@@ -1128,7 +1432,7 @@ function CoverLetterTab({ coverLetter, onRegenerate, regenerating, T }) {
   );
 }
 
-function ResumeTab({ suggestions, talkingPoints, resumeText, onReword, rewordingIdx, atsResult, T }) {
+function ResumeTab({ suggestions, talkingPoints, resumeText, onReword, rewordingIdx, atsResult, customizations, T }) {
   const [checked, setChecked] = useState({});
   const [rewordInputs, setRewordInputs] = useState({});
   const [builtResume, setBuiltResume] = useState("");
@@ -1159,6 +1463,81 @@ function ResumeTab({ suggestions, talkingPoints, resumeText, onReword, rewording
         <div style={{ marginBottom: 24 }}>
           <SectionLabel T={T}>ATS readiness</SectionLabel>
           <AtsReport result={atsResult} T={T} compact />
+        </div>
+      )}
+
+      {/* Deterministic customizations based on this specific job posting */}
+      {customizations && customizations.length > 0 && (
+        <div style={{ marginBottom: 28 }}>
+          <SectionLabel T={T}>Customize your resume for this posting</SectionLabel>
+          <div style={{ fontSize: 12, color: T.textMuted, marginBottom: 14, lineHeight: 1.5 }}>
+            These recommendations compare your resume directly against this specific job description and market data.
+          </div>
+          {customizations.map((group, gi) => (
+            <Card key={gi} T={T} style={{ marginBottom: 12 }}>
+              <div style={{ fontSize: 13, fontWeight: 600, color: T.textBright, marginBottom: 4 }}>
+                {group.title}
+              </div>
+              <div style={{ fontSize: 12, color: T.textMuted, marginBottom: 10, lineHeight: 1.5 }}>
+                {group.detail}
+              </div>
+              {group.type === "keywords" && (
+                <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
+                  {group.items.map((item, i) => (
+                    <span key={i} style={{
+                      padding: "4px 10px", fontSize: 12, borderRadius: 6,
+                      background: T.accentSoft, color: T.accentInk,
+                      border: "1px solid " + T.accent + "33",
+                      fontWeight: 500,
+                    }}>
+                      {item}
+                    </span>
+                  ))}
+                </div>
+              )}
+              {group.type === "unstated" && (
+                <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
+                  {group.items.map((item, i) => (
+                    <span key={i} style={{
+                      padding: "4px 10px", fontSize: 12, borderRadius: 6,
+                      background: T.warning + "18", color: T.warning,
+                      border: "1px solid " + T.warning + "33",
+                      fontWeight: 500,
+                    }}>
+                      {item}
+                    </span>
+                  ))}
+                </div>
+              )}
+              {group.type === "gaps" && (
+                <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
+                  {group.items.map((item, i) => (
+                    <span key={i} style={{
+                      padding: "4px 10px", fontSize: 12, borderRadius: 6,
+                      background: T.bgInput, color: T.textSecondary,
+                      border: "1px solid " + T.borderStrong,
+                    }}>
+                      {item}
+                    </span>
+                  ))}
+                </div>
+              )}
+              {group.type === "sections" && (
+                <div>
+                  {group.items.map((item, i) => (
+                    <div key={i} style={{
+                      padding: "8px 0",
+                      borderBottom: i < group.items.length - 1 ? "1px solid " + T.border : "none",
+                      display: "flex", gap: 10, alignItems: "flex-start",
+                    }}>
+                      <span style={{ color: T.accentInk, fontSize: 12, marginTop: 2, flexShrink: 0 }}>{"\u2192"}</span>
+                      <span style={{ fontSize: 12, color: T.text, lineHeight: 1.55 }}>{item}</span>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </Card>
+          ))}
         </div>
       )}
 
@@ -1281,24 +1660,6 @@ function ResumeTab({ suggestions, talkingPoints, resumeText, onReword, rewording
             Edit anything below, then export. Suggested additions are grouped at the end so you can place them where they fit.
           </div>
           <TextArea value={builtResume} onChange={setBuiltResume} T={T} rows={20} />
-        </div>
-      )}
-
-      {talkingPoints && talkingPoints.length > 0 && (
-        <div>
-          <SectionLabel T={T}>Interview talking points</SectionLabel>
-          <Card T={T}>
-            {talkingPoints.map((tp, i) => (
-              <div key={i} style={{
-                padding: "8px 0",
-                borderBottom: i < talkingPoints.length - 1 ? "1px solid " + T.border : "none",
-                display: "flex", gap: 10, alignItems: "flex-start",
-              }}>
-                <span style={{ color: T.accent, fontSize: 12, marginTop: 2, flexShrink: 0 }}>{"\u2192"}</span>
-                <span style={{ fontSize: 13, color: T.textBright, lineHeight: 1.5 }}>{tp}</span>
-              </div>
-            ))}
-          </Card>
         </div>
       )}
     </div>
@@ -1857,6 +2218,108 @@ function resolveSeniorityKey(seniority, salaryRanges) {
     if (down && salaryRanges[down]) return { key: down, substituted: true, from: seniority };
   }
   return { key: "Mid", substituted: true, from: seniority };
+}
+
+// ─── POSITIONING STRATEGY (deterministic — no AI for the core analysis) ─────
+// Computes which of the applicant's experiences are differentiating vs.
+// table-stakes for this specific posting, using market frequency data.
+// The AI's role is limited to framing the strategic angle in a sentence.
+function buildPositioningStrategy(profile, jobText, intel, jobDims) {
+  if (!profile || !jobText || !intel) return null;
+  const jobLower = (jobText || "").toLowerCase();
+  const norm = (s) => (s || "").toLowerCase().replace(/[^a-z0-9]/g, "");
+
+  // Classify each of the applicant's methods against the market and this posting.
+  const methodAnalysis = (profile.methods || []).map(method => {
+    const methodLower = method.toLowerCase();
+    const inJob = jobLower.includes(methodLower);
+    const marketItem = intel.topMethods.find(m =>
+      m.name.toLowerCase().includes(methodLower) || methodLower.includes(m.name.toLowerCase())
+    );
+    const marketPct = marketItem ? marketItem.pct : 0;
+    // Table-stakes: >55% of postings ask for it. Differentiating: <55%.
+    const category = !inJob ? "irrelevant" : marketPct > 55 ? "table_stakes" : marketPct > 0 ? "differentiating" : "unique";
+    return { method, inJob, marketPct, category };
+  });
+
+  // Methods the JOB asks for that the applicant DOESN'T have.
+  const jobMethodGaps = intel.topMethods.filter(m => {
+    const mLower = m.name.toLowerCase();
+    if (!jobLower.includes(mLower)) return false;
+    const hasIt = (profile.methods || []).some(pm => pm.toLowerCase().includes(mLower) || mLower.includes(pm.toLowerCase()));
+    return !hasIt;
+  });
+
+  // Lead-with themes: things the applicant has that this job asks for AND
+  // that are differentiating (not everyone has them).
+  const leadWith = methodAnalysis.filter(m => m.category === "differentiating" || m.category === "unique");
+  const tableStakes = methodAnalysis.filter(m => m.category === "table_stakes");
+
+  // Market-informed hooks: signals from the Meridian data that give the
+  // applicant an edge most candidates won't know to mention.
+  const hooks = [];
+
+  // AI hook
+  if (profile.ai_experience && jobLower.includes("ai")) {
+    hooks.push({
+      theme: "AI experience",
+      insight: "This posting mentions AI, and only " + intel.aiMentionRate + "% of " + intel.label + " postings do. Your AI experience is a genuine differentiator here — most applicants for this role won't have it.",
+    });
+  } else if (profile.ai_experience && !jobLower.includes("ai")) {
+    hooks.push({
+      theme: "AI experience (not required but relevant)",
+      insight: intel.aiMentionRate + "% of " + intel.label + " postings now mention AI. This one doesn't explicitly, but demonstrating AI fluency positions you ahead of the curve.",
+    });
+  } else if (!profile.ai_experience && jobLower.includes("ai")) {
+    hooks.push({
+      theme: "AI gap",
+      insight: "This posting mentions AI and you don't show AI experience. Consider whether any of your work touched AI/ML products or workflows, even indirectly, and frame it accordingly.",
+    });
+  }
+
+  // Mentoring/leadership hook for manager+ roles
+  const seniorityIdx = ["Intern", "Entry", "Mid", "Senior", "Manager", "Lead", "Staff", "Principal", "Director", "VP", "Head"]
+    .indexOf(jobDims?.seniority || "Mid");
+  if (seniorityIdx >= 4 && (jobLower.includes("mentor") || jobLower.includes("lead"))) {
+    const hasMentoring = (profile.methods || []).concat(profile.soft_skills || []).some(s =>
+      s.toLowerCase().includes("mentor") || s.toLowerCase().includes("lead") || s.toLowerCase().includes("manag")
+    );
+    if (hasMentoring) {
+      hooks.push({
+        theme: "Leadership and mentoring",
+        insight: "This is a " + (jobDims?.seniority || "senior") + "-level role that explicitly asks for mentoring. Lead with concrete examples of people you've developed, not just work you've directed.",
+      });
+    }
+  }
+
+  // Emerging signals hook
+  const emergingMatches = intel.emergingSignals.filter(sig =>
+    jobLower.includes(sig.toLowerCase()) &&
+    (profile.methods || []).concat(profile.specializations || []).some(s =>
+      s.toLowerCase().includes(sig.toLowerCase()) || sig.toLowerCase().includes(s.toLowerCase())
+    )
+  );
+  if (emergingMatches.length > 0) {
+    hooks.push({
+      theme: "Emerging area alignment",
+      insight: "This posting touches " + emergingMatches.join(", ") + " — areas that are still emerging in the market. Your experience here puts you ahead of most applicants.",
+    });
+  }
+
+  // What NOT to dwell on
+  const dontOverIndex = tableStakes.filter(m => m.marketPct >= 65).map(m => ({
+    method: m.method,
+    reason: m.marketPct + "% of postings require this. Mention it, but don't spend space proving you can do it — reviewers will assume you can.",
+  }));
+
+  return {
+    leadWith,
+    tableStakes,
+    hooks,
+    dontOverIndex,
+    jobMethodGaps,
+    methodAnalysis,
+  };
 }
 
 // ─── JOB VS MARKET COMPARISON (deterministic — no AI) ───────────────────────
@@ -2466,6 +2929,29 @@ function Tailor() {
     });
   }, [resumeText, profile, discipline, jobText]);
 
+  // Deterministic positioning strategy. Recomputes when profile, job text,
+  // or discipline changes. No AI involved.
+  const positioningStrategy = useMemo(() => {
+    if (!profile || !jobText || jobText.trim().length < 100) return null;
+    return buildPositioningStrategy(
+      profile,
+      jobText,
+      MARKET_INTEL[(profile && profile.discipline) || discipline],
+      jobDims
+    );
+  }, [profile, jobText, discipline, jobDims]);
+
+  // Deterministic resume customizations specific to this posting.
+  const resumeCustomizations = useMemo(() => {
+    if (!profile || !jobText || jobText.trim().length < 100 || !resumeText) return null;
+    return buildResumeCustomizations(
+      profile,
+      jobText,
+      resumeText,
+      MARKET_INTEL[(profile && profile.discipline) || discipline]
+    );
+  }, [profile, jobText, resumeText, discipline]);
+
   useEffect(() => {
     if (typeof document !== "undefined" && document.body) {
       document.body.style.background = T.bg;
@@ -2608,6 +3094,17 @@ function Tailor() {
         }
       }
       if (!parsed) throw (lastErr || new Error("Could not analyze the posting."));
+
+      // Merge deterministic salary extraction (runs on the FULL text, so it
+      // catches salary ranges that appear at the bottom of long postings,
+      // which the truncated AI excerpt misses).
+      const detectedSalary = extractSalaryFromText(text);
+      if (detectedSalary) {
+        parsed.salary_listed = true;
+        parsed.salary_min = detectedSalary.min;
+        parsed.salary_max = detectedSalary.max;
+      }
+
       setJobDims(parsed);
     } catch (err) {
       if (err.name === "AbortError") return;
@@ -2795,11 +3292,11 @@ function Tailor() {
       const controller = new AbortController();
       abortRef.current = controller;
 
-      // Call 1: cover letter and positioning.
-      const letterPart = await runWithFallback((budget) =>
-        "You are an expert career advisor. Write a tailored cover letter.\n\n" +
-        "Respond with ONLY a JSON object, no other text, with keys: cover_letter (about 250 words, professional and specific, referencing real experience from the resume and real requirements from the posting), position_strength (one sentence naming the applicant's strongest angle).\n\n" +
-        marketLine + voiceInstructions + profileInstructions +
+      // Call 1: positioning strength only (one sentence, small).
+      const posPart = await runWithFallback((budget) =>
+        "You are an expert career advisor. Identify the applicant's single strongest positioning angle for this specific role.\n\n" +
+        "Respond with ONLY a JSON object, no other text, with key: position_strength (one sentence describing their best angle for this posting, referencing a specific strength from their resume and a specific requirement from the posting).\n\n" +
+        marketLine + profileInstructions +
         "\n\nJOB DESCRIPTION:\n" + fullJob.slice(0, budget) +
         "\n\nAPPLICANT RESUME:\n" + fullResume.slice(0, budget)
       , controller);
@@ -2823,13 +3320,13 @@ function Tailor() {
       , controller);
 
       setResults({
-        cover_letter: letterPart.cover_letter || "",
-        position_strength: letterPart.position_strength || "",
+        cover_letter: "",
+        position_strength: posPart.position_strength || "",
         suggestions: suggestPart.suggestions || [],
         talking_points: talkPart.talking_points || [],
       });
       setStep("results");
-      setActiveTab("cover");
+      setActiveTab("strategy");
     } catch (err) {
       if (err.name === "AbortError") return;
       const msg = err.message || "";
@@ -2841,6 +3338,58 @@ function Tailor() {
       setStep("input");
     }
   }, [jobText, resumeText, voiceText, discipline, seniority, profile, atsResult]);
+
+  // ── Generate cover letter on demand (not automatically) ──
+  const [coverGenerating, setCoverGenerating] = useState(false);
+  const generateCoverLetter = useCallback(async () => {
+    setCoverGenerating(true);
+    setError(null);
+
+    const cleanVoice = sanitizeText(voiceText).slice(0, 800);
+    let voiceInstr = "";
+    if (cleanVoice) {
+      voiceInstr = "\n\nMatch this writing style without mentioning it:\n" + cleanVoice;
+    }
+
+    const fullJob = sanitizeText(jobText);
+    const fullResume = sanitizeText(resumeText);
+
+    try {
+      const controller = new AbortController();
+      abortRef.current = controller;
+      const budgets = [3500];
+      let parsed = null;
+      let lastErr = null;
+      for (const budget of budgets) {
+        try {
+          const raw = await callClaude(
+            "You are an expert career advisor. Write a tailored cover letter.\n\n" +
+            "Respond with ONLY a JSON object, no other text, with key: cover_letter (about 250 words, professional and specific, referencing real experience from the resume and real requirements from the posting).\n\n" +
+            voiceInstr +
+            "\n\nJOB DESCRIPTION:\n" + fullJob.slice(0, budget) +
+            "\n\nAPPLICANT RESUME:\n" + fullResume.slice(0, budget),
+            controller.signal
+          );
+          parsed = parseModelJson(raw);
+          if (parsed) break;
+          lastErr = new Error("Could not read the cover letter.");
+        } catch (e) {
+          if (e.name === "AbortError") throw e;
+          lastErr = e;
+        }
+      }
+      if (parsed && parsed.cover_letter) {
+        setResults(r => ({ ...r, cover_letter: parsed.cover_letter }));
+      } else {
+        setError((lastErr && lastErr.message) || "Could not generate cover letter.");
+      }
+    } catch (err) {
+      if (err.name === "AbortError") return;
+      setError(err.message || "Could not generate cover letter.");
+    } finally {
+      setCoverGenerating(false);
+    }
+  }, [jobText, resumeText, voiceText]);
 
   // ── Regenerate cover letter with edit instructions ──
   const regenerateCoverLetter = useCallback(async (editRequest, onDone) => {
@@ -2965,6 +3514,7 @@ function Tailor() {
         {isReady && step === "results" && (
           <div style={{ display: "flex", gap: 0, marginLeft: 4 }}>
             {[
+              { id: "strategy", label: "Strategy" },
               { id: "cover", label: "Cover Letter" },
               { id: "resume", label: "Resume" },
               { id: "market", label: "Market Intel" },
@@ -3431,6 +3981,20 @@ function Tailor() {
               </div>
             )}
 
+            {/* Job vs. market analysis — shows as soon as job text is pasted */}
+            {jobText.length > 150 && (
+              <div style={{ marginTop: 20 }}>
+                <JobVsMarket
+                  jobDims={jobDims}
+                  jobDimsLoading={jobDimsLoading}
+                  jobDimsError={jobDimsError}
+                  intel={MARKET_INTEL[discipline]}
+                  jobTextLength={jobText.length}
+                  T={T}
+                />
+              </div>
+            )}
+
             <div style={{ display: "flex", justifyContent: "center", flexDirection: "column", alignItems: "center", gap: 8, marginTop: 20 }}>
               <Btn primary onClick={analyze} disabled={!canAnalyze} T={T}>
                 Analyze &amp; Tailor
@@ -3450,27 +4014,9 @@ function Tailor() {
         {/* RESULTS */}
         {isReady && step === "results" && results && (
           <div>
-            {results.position_strength && (
-              <Card T={T} style={{ marginBottom: 24, borderColor: T.accent + "33", background: T.accentSoft }}>
-                <div style={{ display: "flex", gap: 12, alignItems: "flex-start" }}>
-                  <span style={{ fontSize: 16, color: T.accentInk, marginTop: 1 }}>{"\u25CE"}</span>
-                  <div>
-                    <div style={{
-                      fontSize: 10, color: T.accentInk, textTransform: "uppercase",
-                      letterSpacing: "0.06em", fontWeight: 600, marginBottom: 4,
-                    }}>
-                      Your strongest angle
-                    </div>
-                    <div style={{ fontSize: 14, color: T.textBright, lineHeight: 1.5 }}>
-                      {results.position_strength}
-                    </div>
-                  </div>
-                </div>
-              </Card>
-            )}
-
-            {activeTab === "cover" && <CoverLetterTab coverLetter={results.cover_letter} onRegenerate={regenerateCoverLetter} regenerating={regenerating} T={T} />}
-            {activeTab === "resume" && <ResumeTab suggestions={results.suggestions} talkingPoints={results.talking_points} resumeText={resumeText} onReword={rewordSuggestion} rewordingIdx={rewordingIdx} atsResult={atsResult} T={T} />}
+            {activeTab === "strategy" && <PositioningTab strategy={positioningStrategy} positionStrength={results.position_strength} talkingPoints={results.talking_points} T={T} />}
+            {activeTab === "cover" && <CoverLetterTab coverLetter={results.cover_letter} onGenerate={generateCoverLetter} generating={coverGenerating} onRegenerate={regenerateCoverLetter} regenerating={regenerating} T={T} />}
+            {activeTab === "resume" && <ResumeTab suggestions={results.suggestions} talkingPoints={results.talking_points} resumeText={resumeText} onReword={rewordSuggestion} rewordingIdx={rewordingIdx} atsResult={atsResult} customizations={resumeCustomizations} T={T} />}
             {activeTab === "market" && <MarketIntelTab discipline={discipline} seniority={seniority} jobText={jobText} jobDims={jobDims} jobDimsLoading={jobDimsLoading} jobDimsError={jobDimsError} T={T} />}
           </div>
         )}
