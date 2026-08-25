@@ -615,8 +615,11 @@ async function callClaudeOnce(prompt, signal, maxTokens) {
   return text;
 }
 
-// ─── MARKET INTELLIGENCE (Production: computed live from Supabase) ───────────
-const MARKET_INTEL = {
+// ─── MARKET INTELLIGENCE ─────────────────────────────────────────────────────
+// FALLBACK_INTEL is illustrative data, used only when the live Meridian
+// connection (/api/market) is unavailable. Every place this is shown to the
+// user carries a provenance line saying so — see <Provenance>.
+const FALLBACK_INTEL = {
   uxr: {
     label: "UX Research",
     topMethods: [
@@ -644,11 +647,11 @@ const MARKET_INTEL = {
       Director: [160000, 300000],
     },
     topResponsibilities: [
-      "Conduct end-to-end research studies",
-      "Present findings to stakeholders",
-      "Influence product strategy with insights",
-      "Develop actionable recommendations",
-      "Collaborate cross-functionally with design and engineering",
+      { name: "Conduct end-to-end research studies", pct: 74 },
+      { name: "Present findings to stakeholders", pct: 66 },
+      { name: "Develop actionable recommendations", pct: 58 },
+      { name: "Influence product strategy with insights", pct: 47 },
+      { name: "Collaborate cross-functionally with design and engineering", pct: 41 },
     ],
     emergingSignals: ["AI product research", "Agentic AI", "Research operations", "Research democratization", "AI-augmented workflows"],
     degreeRate: 58,
@@ -687,11 +690,11 @@ const MARKET_INTEL = {
       Senior: [120000, 200000], Manager: [145000, 230000], Lead: [145000, 240000], Director: [155000, 290000],
     },
     topResponsibilities: [
-      "Own end-to-end design for product areas",
-      "Build and maintain design systems",
-      "Collaborate with engineering on implementation",
-      "Conduct design reviews and critiques",
-      "Mentor junior designers",
+      { name: "Own end-to-end design for product areas", pct: 71 },
+      { name: "Build and maintain design systems", pct: 55 },
+      { name: "Collaborate with engineering on implementation", pct: 49 },
+      { name: "Conduct design reviews and critiques", pct: 38 },
+      { name: "Mentor junior designers", pct: 26 },
     ],
     emergingSignals: ["AI-native interaction patterns", "Prompt UX", "Generative design tools", "Conversational UI", "Multimodal interfaces"],
     degreeRate: 48,
@@ -731,11 +734,11 @@ const MARKET_INTEL = {
       Director: [180000, 320000],
     },
     topResponsibilities: [
-      "Define product strategy and vision",
-      "Manage product roadmap and priorities",
-      "Drive cross-functional alignment",
-      "Analyze product metrics and KPIs",
-      "Lead go-to-market execution",
+      { name: "Define product strategy and vision", pct: 69 },
+      { name: "Manage product roadmap and priorities", pct: 63 },
+      { name: "Drive cross-functional alignment", pct: 54 },
+      { name: "Analyze product metrics and KPIs", pct: 46 },
+      { name: "Lead go-to-market execution", pct: 33 },
     ],
     emergingSignals: ["AI product strategy", "Agentic product design", "LLM-powered features", "AI safety considerations", "Model evaluation"],
     degreeRate: 52,
@@ -749,6 +752,124 @@ const MARKET_INTEL = {
     ],
   },
 };
+
+// ─── LIVE MARKET DATA MERGE ──────────────────────────────────────────────────
+// Live aggregates from /api/market overlay onto FALLBACK_INTEL. emergingSignals
+// is never computed live (Meridian doesn't track it as a metric) and always
+// comes from the fallback; every other field is used live when present, so a
+// partial live response still improves on pure fallback data field-by-field.
+function mergeIntel(discipline, marketByDiscipline) {
+  const fb = FALLBACK_INTEL[discipline];
+  if (!fb) return null;
+  const entry = marketByDiscipline && marketByDiscipline[discipline];
+  const d = entry && entry.status === "ready" ? entry.data : null;
+  if (!d) return { ...fb, provenance: { live: false } };
+  return {
+    label: fb.label,
+    emergingSignals: fb.emergingSignals,
+    topMethods: d.topMethods && d.topMethods.length ? d.topMethods : fb.topMethods,
+    topSoftSkills: d.topSoftSkills && d.topSoftSkills.length ? d.topSoftSkills : fb.topSoftSkills,
+    topTools: d.topTools && d.topTools.length ? d.topTools : fb.topTools,
+    topResponsibilities: d.topResponsibilities && d.topResponsibilities.length ? d.topResponsibilities : fb.topResponsibilities,
+    aiMentionRate: typeof d.aiMentionRate === "number" ? d.aiMentionRate : fb.aiMentionRate,
+    degreeRate: typeof d.degreeRate === "number" ? d.degreeRate : fb.degreeRate,
+    salaryRanges: d.salaryRanges && Object.keys(d.salaryRanges).length ? d.salaryRanges : fb.salaryRanges,
+    requirementsCountDist: d.requirementsCountDist || null,
+    responsibilityCountDist: d.responsibilityCountDist || null,
+    yearsBySeniority: d.yearsBySeniority || null,
+    trends: d.trends || null,
+    provenance: { live: true, postingCount: d.postingCount, updatedAt: d.updatedAt },
+  };
+}
+
+// This line is the differentiator: no competitor can print it honestly.
+function formatProvenanceText(intel) {
+  if (!intel || !intel.provenance) return "";
+  if (!intel.provenance.live) return "Illustrative market data — live Meridian connection unavailable";
+  const count = intel.provenance.postingCount;
+  const date = intel.provenance.updatedAt;
+  const dateLabel = date
+    ? new Date(date + "T00:00:00").toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" })
+    : "recently";
+  return "Based on " + (count != null ? count : "many") + " active " + intel.label + " postings · Meridian · updated " + dateLabel;
+}
+
+function Provenance({ intel, T, style }) {
+  const text = formatProvenanceText(intel);
+  if (!text) return null;
+  const live = intel.provenance && intel.provenance.live;
+  return (
+    <div style={{
+      fontSize: 10.5, color: live ? T.textDim : T.warning,
+      marginTop: 4, marginBottom: 4, fontStyle: live ? "normal" : "italic",
+      ...style,
+    }}>
+      {text}
+    </div>
+  );
+}
+
+// ─── CANONICAL VOCABULARY (curated aliases → Meridian's market-standard term)
+// Meridian's own per-record method extraction defines the market-standard name
+// for each concept. This is a curated subset of common colloquial phrasings
+// mapped to that standard term, used to nudge resume wording toward what ATS
+// keyword matching and postings themselves are tuned to.
+const CANONICAL_VOCABULARY = {
+  uxr: [
+    { canonical: "Interviews", aliases: ["talking to customers", "talking to users", "chatting with users", "customer conversations", "user conversations"] },
+    { canonical: "Usability Testing", aliases: ["watching people use the product", "testing with users", "click testing", "product testing sessions"] },
+    { canonical: "Surveys", aliases: ["asking users questions", "questionnaires to customers", "polling users"] },
+    { canonical: "Card Sorting", aliases: ["sorting exercises", "categorization exercises"] },
+    { canonical: "A/B Testing", aliases: ["split testing", "comparing two versions"] },
+    { canonical: "Journey Mapping", aliases: ["mapping the user experience", "charting the user path"] },
+    { canonical: "Persona Development", aliases: ["building user profiles", "user archetypes"] },
+    { canonical: "Diary Studies", aliases: ["tracking users over time", "longitudinal user logs"] },
+    { canonical: "Heuristic Evaluation", aliases: ["expert walkthrough", "informal usability review"] },
+    { canonical: "Ethnography", aliases: ["field observation", "watching users in their environment"] },
+  ],
+  design: [
+    { canonical: "Wireframing", aliases: ["sketching layouts", "rough screen drafts", "low-fidelity mockups"] },
+    { canonical: "Prototyping", aliases: ["building clickable demos", "interactive mockups", "proof-of-concept screens"] },
+    { canonical: "Design Systems", aliases: ["shared component library", "reusable UI kit"] },
+    { canonical: "User Flows", aliases: ["mapping screen-to-screen paths", "navigation diagrams"] },
+    { canonical: "Interaction Design", aliases: ["designing how things behave", "micro-interaction design"] },
+    { canonical: "Visual Design", aliases: ["making it look good", "polishing the UI"] },
+    { canonical: "Responsive Design", aliases: ["making it work on all screens", "mobile-friendly layouts"] },
+    { canonical: "Accessibility Evaluation", aliases: ["accessibility checks", "a11y review"] },
+    { canonical: "Design Critique", aliases: ["design feedback sessions", "peer reviews of designs"] },
+  ],
+  pm: [
+    { canonical: "Roadmapping", aliases: ["planning what's next", "sequencing future work"] },
+    { canonical: "User Story Writing", aliases: ["writing tickets", "documenting requirements informally"] },
+    { canonical: "OKR Setting", aliases: ["setting team goals", "defining success metrics"] },
+    { canonical: "Competitive Analysis", aliases: ["checking out competitors", "market scanning"] },
+    { canonical: "A/B Testing", aliases: ["running experiments", "comparing feature versions"] },
+    { canonical: "Stakeholder Mapping", aliases: ["figuring out who cares", "identifying key people"] },
+    { canonical: "Customer Interviews", aliases: ["talking to customers", "customer conversations"] },
+    { canonical: "Go-to-Market Planning", aliases: ["launch planning", "rollout planning"] },
+  ],
+};
+
+// Deterministic: for each market method the posting asks for, if the resume
+// uses a known colloquial alias instead of the canonical term, flag it.
+function findCanonicalVocabularyGaps(discipline, jobText, resumeText, intel) {
+  const jobLower = (jobText || "").toLowerCase();
+  const resumeLower = (resumeText || "").toLowerCase();
+  const entries = CANONICAL_VOCABULARY[discipline] || [];
+  const out = [];
+  entries.forEach(({ canonical, aliases }) => {
+    const marketItem = (intel.topMethods || []).find(m => m.name.toLowerCase() === canonical.toLowerCase());
+    if (!marketItem) return;
+    const canonicalLower = canonical.toLowerCase();
+    const postingWantsIt = jobLower.includes(canonicalLower) || aliases.some(a => jobLower.includes(a));
+    if (!postingWantsIt) return;
+    if (resumeLower.includes(canonicalLower)) return;
+    const matchedAlias = aliases.find(a => resumeLower.includes(a));
+    if (!matchedAlias) return;
+    out.push({ alias: matchedAlias, canonical, pct: marketItem.pct });
+  });
+  return out;
+}
 
 // ─── LOCATION & SENIORITY NORMS (illustrative — production pulls these live
 // from Meridian's location-tagged Supabase records) ──────────────────────────
@@ -1037,12 +1158,12 @@ function CopyBtn({ text, T }) {
 }
 
 // ─── LOADING ────────────────────────────────────────────────────────────────
-function LoadingView({ discipline, T }) {
+function LoadingView({ discipline, intelLabel, T }) {
   const [idx, setIdx] = useState(0);
   const msgs = [
     "Reading job requirements",
     "Cross-referencing market data",
-    "Analyzing " + (MARKET_INTEL[discipline]?.label || "market") + " landscape",
+    "Analyzing " + (intelLabel || "market") + " landscape",
     "Identifying positioning angles",
     "Drafting tailored content",
   ];
@@ -1121,7 +1242,7 @@ function ExportButtons({ title, text, T }) {
 // Compares the specific job posting's requirements against the resume's content
 // and produces targeted editing recommendations: keywords to mirror, experience
 // to reframe, and sections to add or strengthen.
-function buildResumeCustomizations(profile, jobText, resumeText, intel) {
+function buildResumeCustomizations(profile, jobText, resumeText, intel, discipline) {
   if (!profile || !jobText || !resumeText || !intel) return null;
   const jobLower = (jobText || "").toLowerCase();
   const resumeLower = (resumeText || "").toLowerCase();
@@ -1232,12 +1353,26 @@ function buildResumeCustomizations(profile, jobText, resumeText, intel) {
     });
   }
 
+  // 5. Canonical vocabulary (Part 2F) — nonstandard phrasing of a method the
+  // posting asks for, mapped to Meridian's market-standard term.
+  const vocabDiscipline = discipline || profile.discipline;
+  const vocabGaps = findCanonicalVocabularyGaps(vocabDiscipline, jobText, resumeText, intel);
+  if (vocabGaps.length > 0) {
+    customizations.push({
+      type: "vocabulary",
+      title: "Use the market-standard term",
+      detail: "ATS systems across companies are tuned to the standard term. These phrasings in your resume have a more standard equivalent.",
+      items: vocabGaps.map(g => "You write “" + g.alias + "”; the market standard term is “" + g.canonical + "” (" + g.pct + "% of postings)."),
+    });
+  }
+
   return customizations.length > 0 ? customizations : null;
 }
 
 // ─── POSITIONING STRATEGY TAB ───────────────────────────────────────────────
-function PositioningTab({ strategy, positionStrength, talkingPoints, T }) {
+function PositioningTab({ strategy, positionStrength, talkingPoints, rarityHook, responsibilityAlignment, intel, T }) {
   if (!strategy) return <div style={{ color: T.textMuted, fontSize: 13 }}>No positioning analysis available.</div>;
+  const allHooks = (strategy.hooks || []).concat(rarityHook ? [rarityHook] : []);
 
   return (
     <div>
@@ -1284,13 +1419,14 @@ function PositioningTab({ strategy, positionStrength, talkingPoints, T }) {
       )}
 
       {/* Market-informed hooks */}
-      {strategy.hooks && strategy.hooks.length > 0 && (
+      {allHooks.length > 0 && (
         <div style={{ marginBottom: 24 }}>
           <SectionLabel T={T}>Market-informed hooks</SectionLabel>
-          <div style={{ fontSize: 12, color: T.textMuted, marginBottom: 10, lineHeight: 1.5 }}>
+          <div style={{ fontSize: 12, color: T.textMuted, marginBottom: 4, lineHeight: 1.5 }}>
             Angles informed by what Meridian sees across the market that most applicants won't think to use.
           </div>
-          {strategy.hooks.map((hook, i) => (
+          {intel && <Provenance intel={intel} T={T} style={{ marginBottom: 10 }} />}
+          {allHooks.map((hook, i) => (
             <Card key={i} T={T} style={{ marginBottom: 8 }}>
               <div style={{ fontSize: 13, fontWeight: 600, color: T.accentInk, marginBottom: 4 }}>{hook.theme}</div>
               <div style={{ fontSize: 12, color: T.text, lineHeight: 1.6 }}>{hook.insight}</div>
@@ -1343,6 +1479,9 @@ function PositioningTab({ strategy, positionStrength, talkingPoints, T }) {
         </div>
       )}
 
+      {/* Responsibility alignment (Part 3B) */}
+      <ResponsibilityAlignment alignment={responsibilityAlignment} T={T} />
+
       {/* Talking points for interviews */}
       {talkingPoints && talkingPoints.length > 0 && (
         <div>
@@ -1369,65 +1508,271 @@ function PositioningTab({ strategy, positionStrength, talkingPoints, T }) {
 }
 
 // ─── RESULT TABS ────────────────────────────────────────────────────────────
-function CoverLetterTab({ coverLetter, onGenerate, generating, onRegenerate, regenerating, T }) {
+const COVER_LETTER_CHECKLIST = [
+  "Use specific examples, not general claims — a study you ran, a number you moved.",
+  "The interview test: could you defend every sentence if asked about it face to face?",
+  "Read it aloud. If it doesn't sound like you talking, rewrite the sentence.",
+  "Keep it under 400 words. Longer than that and it stops getting read closely.",
+  "Use the posting's exact terms for methods and skills — mirror its language, not a synonym.",
+  "Contractions are fine. A cover letter that sounds stiff sounds like a template.",
+  "Vary sentence length. Three long sentences in a row reads like it was generated.",
+];
+
+function CoverLetterTab({ coverLetter, onGenerate, generating, onRegenerate, regenerating, jobDims, strategy, rarityHook, voiceSummary, T }) {
   const [editRequest, setEditRequest] = useState("");
+  const [showGenerator, setShowGenerator] = useState(!!coverLetter);
 
-  if (!coverLetter && !generating) {
-    return (
-      <Card T={T}>
-        <div style={{ fontSize: 13, color: T.text, lineHeight: 1.6, marginBottom: 14 }}>
-          Want an AI-drafted cover letter based on your positioning strategy? It'll use your resume, the job description, and your voice profile if you uploaded one. Review and personalize it before sending — your own voice is always stronger.
-        </div>
-        <Btn primary onClick={onGenerate} T={T}>
-          Generate cover letter
-        </Btn>
-      </Card>
-    );
-  }
-
-  if (generating) {
-    return (
-      <div style={{ fontSize: 13, color: T.textMuted, padding: "20px 0" }}>
-        Drafting cover letter...
-      </div>
-    );
-  }
+  const company = (jobDims && jobDims.company) || "this company";
+  const title = (jobDims && jobDims.posting_title) || "this role";
+  const mission = jobDims && jobDims.mission;
+  const differentiators = (strategy && strategy.leadWith || []).slice(0, 3).map(m => m.method);
+  const responsibilities = (jobDims && jobDims.responsibilities || []).slice(0, 4);
 
   return (
     <div>
-      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 14, gap: 12, flexWrap: "wrap" }}>
-        <SectionLabel T={T}>Generated cover letter</SectionLabel>
-        <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
-          <CopyBtn text={coverLetter} T={T} />
-          <ExportButtons title="Cover Letter" text={coverLetter} T={T} />
-        </div>
-      </div>
-
-      <Card T={T} style={{ background: T.bg, marginBottom: 20 }}>
-        <div style={{ fontSize: 13, lineHeight: 1.75, color: T.textBright, whiteSpace: "pre-wrap" }}>
-          {coverLetter}
+      {/* Research stats intro */}
+      <Card T={T} style={{ marginBottom: 20 }}>
+        <div style={{ fontSize: 13, color: T.text, lineHeight: 1.6 }}>
+          Recruiters spend seconds, not minutes, on a first read of a cover letter — and they can tell a templated one from a specific one almost immediately. A letter built from your actual differentiators for this specific posting reads as evidence, not filler. The scaffolding below is built from your positioning strategy; use it to write your own version before reaching for a generated draft.
         </div>
       </Card>
 
-      {/* Edit request + regenerate */}
-      <SectionLabel T={T}>Request edits</SectionLabel>
-      <TextArea
-        value={editRequest}
-        onChange={setEditRequest}
-        T={T}
-        rows={3}
-        placeholder={"Describe what to change. For example: make it shorter, more confident, emphasize my leadership experience, or adjust the opening line."}
-      />
-      <div style={{ marginTop: 12 }}>
-        <Btn
-          primary
-          disabled={regenerating || !editRequest.trim()}
-          onClick={() => onRegenerate(editRequest, () => setEditRequest(""))}
-          T={T}
-        >
-          {regenerating ? "Regenerating..." : "Regenerate cover letter"}
-        </Btn>
+      {/* Problem-Solution walkthrough */}
+      <div style={{ marginBottom: 24 }}>
+        <SectionLabel T={T}>Problem → solution walkthrough</SectionLabel>
+        <Card T={T} style={{ marginBottom: 10 }}>
+          <div style={{ fontSize: 10, color: T.accentInk, textTransform: "uppercase", letterSpacing: "0.06em", fontWeight: 600, marginBottom: 6 }}>
+            The problem {company} is hiring to solve
+          </div>
+          <div style={{ fontSize: 13, color: T.textBright, lineHeight: 1.6 }}>
+            {mission
+              ? mission + " This " + title + " role exists to help move that forward."
+              : "State what " + title + " at " + company + " is responsible for moving forward — pull this from the posting's opening paragraph, not generic language."}
+          </div>
+          {responsibilities.length > 0 && (
+            <div style={{ display: "flex", flexWrap: "wrap", gap: 6, marginTop: 10 }}>
+              {responsibilities.map((r, i) => (
+                <span key={i} style={{ padding: "4px 10px", fontSize: 12, borderRadius: 6, background: T.bgInput, color: T.textSecondary, border: "1px solid " + T.borderStrong }}>
+                  {r}
+                </span>
+              ))}
+            </div>
+          )}
+        </Card>
+        <Card T={T}>
+          <div style={{ fontSize: 10, color: T.accentInk, textTransform: "uppercase", letterSpacing: "0.06em", fontWeight: 600, marginBottom: 6 }}>
+            Why you're the solution
+          </div>
+          {differentiators.length > 0 ? (
+            <div>
+              <div style={{ fontSize: 13, color: T.textBright, lineHeight: 1.6, marginBottom: 8 }}>
+                Lead with your strongest, least-common differentiators for this posting:
+              </div>
+              <div style={{ display: "flex", flexWrap: "wrap", gap: 6, marginBottom: rarityHook ? 10 : 0 }}>
+                {differentiators.map((d, i) => (
+                  <span key={i} style={{ padding: "4px 10px", fontSize: 12, borderRadius: 6, background: T.accentSoft, color: T.accentInk, border: "1px solid " + T.accent + "33", fontWeight: 500 }}>
+                    {d}
+                  </span>
+                ))}
+              </div>
+              {rarityHook && (
+                <div style={{ fontSize: 12, color: T.text, lineHeight: 1.55, paddingTop: 8, borderTop: "1px solid " + T.border }}>
+                  {rarityHook.insight}
+                </div>
+              )}
+            </div>
+          ) : (
+            <div style={{ fontSize: 13, color: T.textMuted, lineHeight: 1.6 }}>
+              Differentiators will appear here once your resume and this posting are both analyzed — check the Strategy tab.
+            </div>
+          )}
+        </Card>
       </div>
+
+      {/* Writing checklist */}
+      <div style={{ marginBottom: 24 }}>
+        <SectionLabel T={T}>Before you send it</SectionLabel>
+        <Card T={T}>
+          {COVER_LETTER_CHECKLIST.map((item, i) => (
+            <div key={i} style={{
+              display: "flex", gap: 10, alignItems: "flex-start", padding: "7px 0",
+              borderTop: i > 0 ? "1px solid " + T.border : "none",
+            }}>
+              <span style={{ color: T.accent, fontSize: 12, marginTop: 2, flexShrink: 0 }}>{"✓"}</span>
+              <span style={{ fontSize: 13, color: T.textBright, lineHeight: 1.5 }}>{item}</span>
+            </div>
+          ))}
+        </Card>
+      </div>
+
+      {/* Voice profile tone reference */}
+      {voiceSummary && (voiceSummary.tone || voiceSummary.characteristics) && (
+        <div style={{ marginBottom: 24 }}>
+          <SectionLabel T={T}>Your voice, for reference</SectionLabel>
+          <Card T={T}>
+            {voiceSummary.tone && voiceSummary.tone.length > 0 && (
+              <div style={{ marginBottom: voiceSummary.characteristics?.length ? 10 : 0 }}>
+                <Chips items={voiceSummary.tone} T={T} tone="accent" />
+              </div>
+            )}
+            {voiceSummary.characteristics && voiceSummary.characteristics.length > 0 && (
+              <Chips items={voiceSummary.characteristics} T={T} />
+            )}
+          </Card>
+        </div>
+      )}
+
+      {/* Generator — demoted to optional scaffolding */}
+      {!showGenerator && (
+        <Card T={T}>
+          <div style={{ fontSize: 13, color: T.text, lineHeight: 1.6, marginBottom: 14 }}>
+            Want a starting draft instead of writing from scratch? Generate one from your resume, this posting, and your voice profile — then edit it until it reads like you, using the checklist above.
+          </div>
+          <Btn primary onClick={() => { setShowGenerator(true); onGenerate(); }} T={T}>
+            Generate a draft
+          </Btn>
+        </Card>
+      )}
+
+      {showGenerator && generating && (
+        <div style={{ fontSize: 13, color: T.textMuted, padding: "20px 0" }}>
+          Drafting cover letter...
+        </div>
+      )}
+
+      {showGenerator && !generating && coverLetter && (
+        <div>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 14, gap: 12, flexWrap: "wrap" }}>
+            <SectionLabel T={T}>Generated draft</SectionLabel>
+            <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
+              <CopyBtn text={coverLetter} T={T} />
+              <ExportButtons title="Cover Letter" text={coverLetter} T={T} />
+            </div>
+          </div>
+
+          <Card T={T} style={{ background: T.bg, marginBottom: 20 }}>
+            <div style={{ fontSize: 13, lineHeight: 1.75, color: T.textBright, whiteSpace: "pre-wrap" }}>
+              {coverLetter}
+            </div>
+          </Card>
+
+          <SectionLabel T={T}>Request edits</SectionLabel>
+          <TextArea
+            value={editRequest}
+            onChange={setEditRequest}
+            T={T}
+            rows={3}
+            placeholder={"Describe what to change. For example: make it shorter, more confident, emphasize my leadership experience, or adjust the opening line."}
+          />
+          <div style={{ marginTop: 12 }}>
+            <Btn
+              primary
+              disabled={regenerating || !editRequest.trim()}
+              onClick={() => onRegenerate(editRequest, () => setEditRequest(""))}
+              T={T}
+            >
+              {regenerating ? "Regenerating..." : "Regenerate draft"}
+            </Btn>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ─── DETERMINISTIC RESUME QUALITY CHECKS (Part 3C) — no AI ─────────────────
+const STRONG_ACTION_VERBS = new Set(["designed", "scaled", "established", "launched", "reduced", "increased", "built", "led", "created", "developed", "transformed", "delivered"]);
+const WEAK_ACTION_VERBS = new Set(["helped", "assisted", "worked", "participated", "supported"]);
+const VAGUE_PHRASES = ["results-driven", "team player", "strong communicator", "detail-oriented", "self-starter", "passionate about", "responsible for", "excellent communication skills", "fast learner", "hard worker"];
+const WEAK_STRONG_EXAMPLES = [
+  { weak: "Responsible for conducting user research", strong: "Led 12 usability studies that shaped the redesign of the checkout flow" },
+  { weak: "Helped the team understand user needs", strong: "Synthesized findings from 30 interviews into a research repository adopted by 3 product teams" },
+  { weak: "Worked on improving the survey process", strong: "Redesigned the survey intake process, cutting analysis time by 40%" },
+  { weak: "Participated in stakeholder meetings", strong: "Presented research findings to VP-level stakeholders, securing buy-in for a new onboarding flow" },
+];
+
+function assessResumeQuality(resumeText) {
+  const text = resumeText || "";
+  const lines = text.split(/\r?\n/).map(l => l.trim()).filter(Boolean);
+  const bulletLines = lines
+    .filter(l => /^[•·\-\*▪●‣⁃]/.test(l))
+    .map(l => l.replace(/^[•·\-\*▪●‣⁃]\s*/, ""));
+
+  const withNumber = bulletLines.filter(l => /\d/.test(l));
+  const impactDensity = bulletLines.length ? Math.round((withNumber.length / bulletLines.length) * 100) : null;
+
+  const firstWord = (l) => ((l.match(/^[a-zA-Z]+/) || [""])[0]).toLowerCase();
+  const strongCount = bulletLines.filter(l => STRONG_ACTION_VERBS.has(firstWord(l))).length;
+  const weakCount = bulletLines.filter(l => WEAK_ACTION_VERBS.has(firstWord(l)) || /^responsible for\b/i.test(l)).length;
+
+  const lower = text.toLowerCase();
+  const vagueFound = VAGUE_PHRASES.filter(p => lower.includes(p));
+
+  return {
+    bulletCount: bulletLines.length,
+    impactDensity,
+    impactFlag: impactDensity !== null && impactDensity < 30,
+    strongVerbCount: strongCount,
+    weakVerbCount: weakCount,
+    vagueFound,
+  };
+}
+
+function ResumeQualityChecks({ resumeText, T }) {
+  const [open, setOpen] = useState(false);
+  const quality = useMemo(() => (resumeText && resumeText.trim().length > 30 ? assessResumeQuality(resumeText) : null), [resumeText]);
+  if (!quality || quality.bulletCount === 0) return null;
+
+  return (
+    <div style={{ marginBottom: 28 }}>
+      <div
+        onClick={() => setOpen(o => !o)}
+        style={{ display: "flex", alignItems: "center", justifyContent: "space-between", cursor: "pointer", marginBottom: open ? 10 : 0 }}
+      >
+        <SectionLabel T={T}>Resume quality checks</SectionLabel>
+        <span style={{ fontSize: 12, color: T.textMuted }}>{open ? "Hide" : "Show"}</span>
+      </div>
+      {open && (
+        <Card T={T}>
+          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12, marginBottom: 16 }}>
+            <div style={{ background: T.bgSubtle, borderRadius: 8, padding: "12px 14px" }}>
+              <div style={{ fontSize: 10, color: T.textMuted, textTransform: "uppercase", letterSpacing: "0.06em", fontWeight: 600, marginBottom: 4 }}>Impact density</div>
+              <div style={{ fontSize: 18, fontWeight: 700, color: quality.impactFlag ? T.warning : T.success }}>{quality.impactDensity}%</div>
+              <div style={{ fontSize: 11, color: T.textDim, marginTop: 2 }}>
+                of bullets contain a number{quality.impactFlag ? " — below the 30% bar" : ""}
+              </div>
+            </div>
+            <div style={{ background: T.bgSubtle, borderRadius: 8, padding: "12px 14px" }}>
+              <div style={{ fontSize: 10, color: T.textMuted, textTransform: "uppercase", letterSpacing: "0.06em", fontWeight: 600, marginBottom: 4 }}>Action-verb strength</div>
+              <div style={{ fontSize: 18, fontWeight: 700, color: quality.weakVerbCount > quality.strongVerbCount ? T.warning : T.success }}>
+                {quality.strongVerbCount} strong / {quality.weakVerbCount} weak
+              </div>
+              <div style={{ fontSize: 11, color: T.textDim, marginTop: 2 }}>of {quality.bulletCount} bullets</div>
+            </div>
+          </div>
+
+          {quality.vagueFound.length > 0 && (
+            <div style={{ marginBottom: 16 }}>
+              <div style={{ fontSize: 12, fontWeight: 600, color: T.textBright, marginBottom: 6 }}>Vague phrases found</div>
+              <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
+                {quality.vagueFound.map((p, i) => (
+                  <span key={i} style={{ padding: "4px 10px", fontSize: 12, borderRadius: 6, background: T.warning + "18", color: T.warning, border: "1px solid " + T.warning + "33" }}>
+                    {p}
+                  </span>
+                ))}
+              </div>
+            </div>
+          )}
+
+          <div style={{ fontSize: 12, fontWeight: 600, color: T.textBright, marginBottom: 8 }}>Weak → strong bullet examples</div>
+          {WEAK_STRONG_EXAMPLES.map((ex, i) => (
+            <div key={i} style={{ padding: "8px 0", borderTop: i > 0 ? "1px solid " + T.border : "none" }}>
+              <div style={{ fontSize: 12, color: T.textDim, textDecoration: "line-through", marginBottom: 3 }}>{ex.weak}</div>
+              <div style={{ fontSize: 12, color: T.success, lineHeight: 1.5 }}>{ex.strong}</div>
+            </div>
+          ))}
+        </Card>
+      )}
     </div>
   );
 }
@@ -1459,6 +1804,8 @@ function ResumeTab({ suggestions, talkingPoints, resumeText, onReword, rewording
 
   return (
     <div>
+      <ResumeQualityChecks resumeText={resumeText} T={T} />
+
       {atsResult && (
         <div style={{ marginBottom: 24 }}>
           <SectionLabel T={T}>ATS readiness</SectionLabel>
@@ -1531,6 +1878,20 @@ function ResumeTab({ suggestions, talkingPoints, resumeText, onReword, rewording
                       display: "flex", gap: 10, alignItems: "flex-start",
                     }}>
                       <span style={{ color: T.accentInk, fontSize: 12, marginTop: 2, flexShrink: 0 }}>{"\u2192"}</span>
+                      <span style={{ fontSize: 12, color: T.text, lineHeight: 1.55 }}>{item}</span>
+                    </div>
+                  ))}
+                </div>
+              )}
+              {group.type === "vocabulary" && (
+                <div>
+                  {group.items.map((item, i) => (
+                    <div key={i} style={{
+                      padding: "8px 0",
+                      borderBottom: i < group.items.length - 1 ? "1px solid " + T.border : "none",
+                      display: "flex", gap: 10, alignItems: "flex-start",
+                    }}>
+                      <span style={{ color: T.accent, fontSize: 12, marginTop: 2, flexShrink: 0 }}>{"\u2261"}</span>
                       <span style={{ fontSize: 12, color: T.text, lineHeight: 1.55 }}>{item}</span>
                     </div>
                   ))}
@@ -1691,6 +2052,137 @@ function VerdictBadge({ verdict, T, labels }) {
   );
 }
 
+// ─── POSTING QUALITY SCORE (Part 2B) + TITLE INFLATION (Part 2C) ───────────
+// Deterministic. Every verdict compares the pasted posting's own stated
+// numbers against the live corpus distributions Meridian computed — no AI.
+function assessPostingQuality(jobDims, intel) {
+  if (!jobDims || !intel) return null;
+  const checks = [];
+  let concernCount = 0;
+
+  // 1. Requirements load — this posting's ask vs. the corpus distribution.
+  const reqCount = (jobDims.required_methods || []).length + (jobDims.required_skills || []).length;
+  if (intel.requirementsCountDist && reqCount > 0) {
+    const d = intel.requirementsCountDist;
+    if (reqCount > d.p90) {
+      checks.push({ id: "requirements", status: "fail", label: "Requirements load", note: "This posting names " + reqCount + " requirements — more than 90% of postings. Wish-list posting: expect the real bar to be lower than the list." });
+      concernCount++;
+    } else if (reqCount < d.p25) {
+      checks.push({ id: "requirements", status: "warn", label: "Requirements load", note: "This posting names only " + reqCount + " requirements, fewer than most postings. May be flexible on background, or light on detail." });
+      concernCount++;
+    } else {
+      checks.push({ id: "requirements", status: "pass", label: "Requirements load", note: "This posting names " + reqCount + " requirements, in line with a typical posting." });
+    }
+  }
+
+  // 2. Responsibility scope — count vs. distribution.
+  const respCount = (jobDims.responsibilities || []).length;
+  if (intel.responsibilityCountDist && respCount > 0) {
+    const d = intel.responsibilityCountDist;
+    if (respCount > d.p90) {
+      checks.push({ id: "responsibilities", status: "warn", label: "Responsibility scope", note: "This posting lists " + respCount + " responsibilities — more than 90% of postings. It may combine multiple jobs into one." });
+      concernCount++;
+    } else if (respCount < d.p25) {
+      checks.push({ id: "responsibilities", status: "warn", label: "Responsibility scope", note: "Only " + respCount + " responsibilities listed, fewer than most postings. The role may be under-specified." });
+      concernCount++;
+    } else {
+      checks.push({ id: "responsibilities", status: "pass", label: "Responsibility scope", note: "This posting lists " + respCount + " responsibilities, in line with a typical posting." });
+    }
+  }
+
+  // 3. Salary transparency — feeds the existing below/competitive/above verdict.
+  const comparison = compareJobToMarket(jobDims, intel);
+  if (comparison && comparison.salary) {
+    const sv = comparison.salary.verdict;
+    if (sv === "unlisted") {
+      checks.push({ id: "salary", status: "warn", label: "Salary transparency", note: "No salary range stated. " + comparison.salary.detail });
+      concernCount++;
+    } else if (sv === "below") {
+      checks.push({ id: "salary", status: "warn", label: "Salary transparency", note: comparison.salary.detail });
+      concernCount++;
+    } else {
+      checks.push({ id: "salary", status: "pass", label: "Salary transparency", note: comparison.salary.detail });
+    }
+  }
+
+  // 4. Level consistency — title inflation detector (Part 2C).
+  let titleInflationNote = null;
+  if (intel.yearsBySeniority && typeof jobDims.years_required === "number" && jobDims.seniority) {
+    const levels = Object.keys(intel.yearsBySeniority);
+    if (levels.length > 0) {
+      let closest = levels[0];
+      let bestDiff = Infinity;
+      levels.forEach((lvl) => {
+        const diff = Math.abs(intel.yearsBySeniority[lvl].p50 - jobDims.years_required);
+        if (diff < bestDiff) { bestDiff = diff; closest = lvl; }
+      });
+      const statedIdx = SENIORITY_ORDER.indexOf(jobDims.seniority);
+      const closestIdx = SENIORITY_ORDER.indexOf(closest);
+      if (statedIdx !== -1 && closestIdx !== -1 && closestIdx !== statedIdx) {
+        if (closestIdx < statedIdx) {
+          titleInflationNote = "Title says " + jobDims.seniority + "; the requirements match what " + closest + "-level postings ask for. Expect the salary band to track the requirements, not the title — calibrate your positioning and negotiation to the band.";
+        } else {
+          titleInflationNote = "This posting asks for more than its title suggests — the requirements match " + closest + "-level postings. If you're under-leveled for " + closest + " titles elsewhere, this may be a good target.";
+        }
+        checks.push({ id: "level", status: "warn", label: "Level consistency", note: titleInflationNote });
+        concernCount++;
+      } else {
+        checks.push({ id: "level", status: "pass", label: "Level consistency", note: "The requirements match what " + jobDims.seniority + "-level postings typically ask for." });
+      }
+    }
+  }
+
+  if (checks.length === 0) return null;
+
+  let verdict, verdictNote;
+  if (concernCount === 0) {
+    verdict = "Well-scoped";
+    verdictNote = "This posting's requirements, responsibilities, and salary transparency are all in line with typical " + intel.label + " postings — a sign of a well-scoped role.";
+  } else if (concernCount === 1) {
+    verdict = "Mixed signals";
+    verdictNote = "Most of this posting reads as typical, but one signal is off — worth reading closely before you invest time tailoring for it.";
+  } else {
+    verdict = "Proceed with caution";
+    verdictNote = "Several signals in this posting run outside the norm for " + intel.label + " postings — often a sign of an under-scoped role, a leveling mismatch, or a wish-list job description.";
+  }
+
+  return { checks, verdict, verdictNote, titleInflationNote, concernCount };
+}
+
+function PostingQualityCard({ quality, T }) {
+  if (!quality) return null;
+  const color = quality.concernCount === 0 ? T.success : quality.concernCount === 1 ? T.warning : T.danger;
+  return (
+    <Card T={T} style={{ marginBottom: 16, borderColor: color + "44" }}>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 12, marginBottom: 10, flexWrap: "wrap" }}>
+        <div style={{ fontSize: 13, fontWeight: 600, color: T.textBright }}>Posting quality</div>
+        <VerdictBadge verdict={quality.concernCount === 0 ? "typical" : quality.concernCount === 1 ? "high" : "demanding"} T={T} labels={{ typical: quality.verdict, high: quality.verdict, demanding: quality.verdict }} />
+      </div>
+      <div style={{ fontSize: 12, color: T.text, lineHeight: 1.55, marginBottom: 12 }}>{quality.verdictNote}</div>
+      {quality.checks.map((c, i) => (
+        <div key={c.id} style={{
+          display: "flex", gap: 10, alignItems: "flex-start", padding: "7px 0",
+          borderTop: i > 0 ? "1px solid " + T.border : "none",
+        }}>
+          <span style={{
+            width: 14, height: 14, borderRadius: 4, flexShrink: 0, marginTop: 2,
+            background: c.status === "pass" ? T.success : "transparent",
+            border: "1.5px solid " + (c.status === "pass" ? T.success : c.status === "warn" ? T.warning : T.danger),
+            display: "flex", alignItems: "center", justifyContent: "center",
+            fontSize: 9, fontWeight: 700, color: c.status === "pass" ? "#fff" : (c.status === "warn" ? T.warning : T.danger),
+          }}>
+            {c.status === "pass" ? "✓" : "!"}
+          </span>
+          <div style={{ flex: 1, minWidth: 0 }}>
+            <div style={{ fontSize: 12, fontWeight: 600, color: T.textBright, marginBottom: 2 }}>{c.label}</div>
+            <div style={{ fontSize: 12, color: T.text, lineHeight: 1.5 }}>{c.note}</div>
+          </div>
+        </div>
+      ))}
+    </Card>
+  );
+}
+
 function JobVsMarket({ jobDims, jobDimsLoading, jobDimsError, intel, jobTextLength, T }) {
   if (jobTextLength < 150) {
     return (
@@ -1735,6 +2227,10 @@ function JobVsMarket({ jobDims, jobDimsLoading, jobDimsError, intel, jobTextLeng
           {seniorityNote}
         </div>
       )}
+      <Provenance intel={intel} T={T} style={{ marginBottom: 14 }} />
+
+      {/* Posting quality score + title inflation (Parts 2B/2C) */}
+      <PostingQualityCard quality={assessPostingQuality(jobDims, intel)} T={T} />
 
       {/* Salary */}
       {salary && (
@@ -1800,8 +2296,7 @@ function JobVsMarket({ jobDims, jobDimsLoading, jobDimsError, intel, jobTextLeng
   );
 }
 
-function MarketIntelTab({ discipline, seniority, jobText, jobDims, jobDimsLoading, jobDimsError, T }) {
-  const intel = MARKET_INTEL[discipline];
+function MarketIntelTab({ discipline, seniority, jobText, jobDims, jobDimsLoading, jobDimsError, intel, T }) {
   if (!intel) return null;
   const jobLower = (jobText || "").toLowerCase();
 
@@ -1828,10 +2323,36 @@ function MarketIntelTab({ discipline, seniority, jobText, jobDims, jobDimsLoadin
         T={T}
       />
 
-      <div style={{ fontSize: 12, color: T.textMuted, marginBottom: 20, lineHeight: 1.6 }}>
+      <div style={{ fontSize: 12, color: T.textMuted, marginBottom: 4, lineHeight: 1.6 }}>
         Market intelligence from Meridian, based on active {intel.label} postings.
         Highlighted items appear in this specific job description.
       </div>
+      <Provenance intel={intel} T={T} style={{ marginBottom: 20 }} />
+
+      {/* Market direction (Part 2A) — deterministic trend deltas, no AI */}
+      {intel.trends && intel.trends.methods && intel.trends.methods.length > 0 && (
+        <div style={{ marginBottom: 24 }}>
+          <SectionLabel T={T}>Market direction — last 90 days vs. prior 90</SectionLabel>
+          <Card T={T} style={{ padding: "14px 18px" }}>
+            {intel.trends.methods.map((m, i) => {
+              const rising = m.currentPct >= m.priorPct;
+              return (
+                <div key={i} style={{
+                  display: "flex", alignItems: "center", justifyContent: "space-between",
+                  padding: "7px 0",
+                  borderBottom: i < intel.trends.methods.length - 1 ? "1px solid " + T.border : "none",
+                }}>
+                  <span style={{ fontSize: 13, color: T.textBright }}>{m.name}</span>
+                  <span style={{ fontSize: 13, fontWeight: 600, color: rising ? T.success : T.danger, display: "flex", alignItems: "center", gap: 6 }}>
+                    {m.priorPct}% {"→"} {m.currentPct}%
+                    <span aria-label={rising ? "rising" : "falling"} style={{ fontSize: 14 }}>{rising ? "▲" : "▼"}</span>
+                  </span>
+                </div>
+              );
+            })}
+          </Card>
+        </div>
+      )}
 
       <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 12, marginBottom: 24 }}>
         {salaryRange && (
@@ -1882,6 +2403,17 @@ function MarketIntelTab({ discipline, seniority, jobText, jobDims, jobDimsLoadin
           </Card>
         </div>
       </div>
+
+      {intel.topResponsibilities && intel.topResponsibilities.length > 0 && (
+        <div style={{ marginBottom: 24 }}>
+          <SectionLabel T={T}>Responsibilities {"—"} market frequency</SectionLabel>
+          <Card T={T} style={{ padding: "16px 18px" }}>
+            {intel.topResponsibilities.slice().sort((a, b) => b.pct - a.pct).map((r, i) => (
+              <BarStat key={i} label={r.name} pct={r.pct} T={T} />
+            ))}
+          </Card>
+        </div>
+      )}
 
       <SectionLabel T={T}>Emerging market signals</SectionLabel>
       <div style={{ display: "flex", flexWrap: "wrap", gap: 8 }}>
@@ -2259,9 +2791,14 @@ function buildPositioningStrategy(profile, jobText, intel, jobDims) {
   // applicant an edge most candidates won't know to mention.
   const hooks = [];
 
-  // AI hook
+  // AI hook — prefers live trend deltas when available (Part 2A).
+  const aiTrend = intel.trends && intel.trends.aiMentionRate;
+  const aiRising = aiTrend && aiTrend.current > aiTrend.prior;
   if (profile.ai_experience && jobLower.includes("ai")) {
-    hooks.push({
+    hooks.push(aiRising ? {
+      theme: "AI experience — rising market ask",
+      insight: "AI mentions in " + intel.label + " postings rose from " + aiTrend.prior + "% to " + aiTrend.current + "% over the last quarter. You have this and the market is moving toward it — lead with it.",
+    } : {
       theme: "AI experience",
       insight: "This posting mentions AI, and only " + intel.aiMentionRate + "% of " + intel.label + " postings do. Your AI experience is a genuine differentiator here — most applicants for this role won't have it.",
     });
@@ -2271,10 +2808,34 @@ function buildPositioningStrategy(profile, jobText, intel, jobDims) {
       insight: intel.aiMentionRate + "% of " + intel.label + " postings now mention AI. This one doesn't explicitly, but demonstrating AI fluency positions you ahead of the curve.",
     });
   } else if (!profile.ai_experience && jobLower.includes("ai")) {
-    hooks.push({
+    hooks.push(aiRising ? {
+      theme: "AI gap — fastest-growing market ask",
+      insight: "This is the fastest-growing ask in the market right now (" + aiTrend.prior + "% → " + aiTrend.current + "% of postings). Worth closing before your next application cycle.",
+    } : {
       theme: "AI gap",
       insight: "This posting mentions AI and you don't show AI experience. Consider whether any of your work touched AI/ML products or workflows, even indirectly, and frame it accordingly.",
     });
+  }
+
+  // Rising-method hook (Part 2A) — any other method (not AI) trending up that
+  // this posting asks for, using the live trend deltas.
+  if (intel.trends && intel.trends.methods && intel.trends.methods.length > 0) {
+    const risingInJob = intel.trends.methods
+      .filter(m => m.currentPct > m.priorPct && jobLower.includes(m.name.toLowerCase()))
+      .sort((a, b) => (b.currentPct - b.priorPct) - (a.currentPct - a.priorPct));
+    if (risingInJob.length > 0) {
+      const top = risingInJob[0];
+      const hasIt = (profile.methods || []).some(pm =>
+        pm.toLowerCase().includes(top.name.toLowerCase()) || top.name.toLowerCase().includes(pm.toLowerCase())
+      );
+      hooks.push(hasIt ? {
+        theme: top.name + " — rising market ask",
+        insight: top.name + " mentions in " + intel.label + " postings rose from " + top.priorPct + "% to " + top.currentPct + "% over the last quarter. You have this and the market is moving toward it — lead with it.",
+      } : {
+        theme: top.name + " — fastest-growing market ask",
+        insight: top.name + " is one of the fastest-growing asks in the market right now (" + top.priorPct + "% → " + top.currentPct + "%) and this posting wants it. Worth closing before your next application cycle.",
+      });
+    }
   }
 
   // Mentoring/leadership hook for manager+ roles
@@ -2320,6 +2881,76 @@ function buildPositioningStrategy(profile, jobText, intel, jobDims) {
     jobMethodGaps,
     methodAnalysis,
   };
+}
+
+// ─── RESPONSIBILITY ALIGNMENT (Part 3B) — deterministic, no AI ─────────────
+// Matches each posting responsibility against the resume's stated outcomes by
+// keyword overlap. A match shows the resume outcome that covers it; no match
+// becomes a flagged gap with guidance to add a quantified bullet.
+const RESP_STOP_WORDS = new Set("the a an and or of to in on at for with your our this that will able have has is are was were from their there across into within".split(" "));
+function respKeywords(s) {
+  return ((s || "").toLowerCase().match(/[a-z][a-z'-]{3,}/g) || []).filter(w => !RESP_STOP_WORDS.has(w));
+}
+function matchResponsibilities(jobResponsibilities, resumeText, profileResponsibilities) {
+  if (!jobResponsibilities || jobResponsibilities.length === 0) return null;
+  const resumeLower = (resumeText || "").toLowerCase();
+  const outcomes = profileResponsibilities || [];
+
+  return jobResponsibilities.map((resp) => {
+    const respWords = respKeywords(resp);
+    let best = null;
+    let bestScore = 0;
+    outcomes.forEach((outcome) => {
+      const outcomeWords = new Set(respKeywords(outcome));
+      const overlap = respWords.filter(w => outcomeWords.has(w)).length;
+      if (overlap > bestScore) { bestScore = overlap; best = outcome; }
+    });
+    if (bestScore >= 2) {
+      return { responsibility: resp, matched: true, matchingOutcome: best };
+    }
+    // Fall back to a direct check against the raw resume text — the resume
+    // may state this outcome in a way that isn't in profile.responsibilities.
+    const directHits = respWords.filter(w => resumeLower.includes(w)).length;
+    const matched = respWords.length > 0 && directHits >= Math.max(2, Math.ceil(respWords.length * 0.5));
+    return { responsibility: resp, matched, matchingOutcome: null };
+  });
+}
+
+function ResponsibilityAlignment({ alignment, T }) {
+  if (!alignment || alignment.length === 0) return null;
+  return (
+    <div style={{ marginBottom: 24 }}>
+      <SectionLabel T={T}>Responsibility alignment</SectionLabel>
+      <div style={{ fontSize: 12, color: T.textMuted, marginBottom: 10, lineHeight: 1.5 }}>
+        Each responsibility this posting states, matched against your resume's outcomes.
+      </div>
+      <Card T={T}>
+        {alignment.map((a, i) => (
+          <div key={i} style={{
+            display: "flex", gap: 10, alignItems: "flex-start", padding: "9px 0",
+            borderTop: i > 0 ? "1px solid " + T.border : "none",
+          }}>
+            <span style={{ fontSize: 13, marginTop: 1, flexShrink: 0, color: a.matched ? T.success : T.warning }}>
+              {a.matched ? "✓" : "–"}
+            </span>
+            <div style={{ flex: 1, minWidth: 0 }}>
+              <div style={{ fontSize: 13, color: T.textBright, fontWeight: 500 }}>{a.responsibility}</div>
+              {a.matched && a.matchingOutcome && (
+                <div style={{ fontSize: 12, color: T.textMuted, marginTop: 3, lineHeight: 1.5 }}>
+                  Matches: "{a.matchingOutcome}"
+                </div>
+              )}
+              {!a.matched && (
+                <div style={{ fontSize: 12, color: T.textMuted, marginTop: 3, lineHeight: 1.5 }}>
+                  Not clearly addressed in your resume — add a quantified bullet showing you've done this.
+                </div>
+              )}
+            </div>
+          </div>
+        ))}
+      </Card>
+    </div>
+  );
 }
 
 // ─── JOB VS MARKET COMPARISON (deterministic — no AI) ───────────────────────
@@ -2536,7 +3167,7 @@ function ProfileField({ label, children, T }) {
   );
 }
 
-function ResumeProfile({ profile, loading, error, discipline, T, collapsedByDefault }) {
+function ResumeProfile({ profile, loading, error, discipline, getIntel, T, collapsedByDefault }) {
   const [open, setOpen] = useState(!collapsedByDefault);
 
   if (loading) {
@@ -2557,7 +3188,7 @@ function ResumeProfile({ profile, loading, error, discipline, T, collapsedByDefa
   }
   if (!profile) return null;
 
-  const intel = MARKET_INTEL[profile.discipline] || MARKET_INTEL[discipline];
+  const intel = getIntel(profile.discipline) || getIntel(discipline);
   const methodCov = intel ? coverage(profile.methods, intel.topMethods) : null;
   const skillCov = intel ? coverage(profile.soft_skills, intel.topSoftSkills) : null;
   const toolCov = intel && intel.topTools ? coverage(profile.tools, intel.topTools) : null;
@@ -2585,7 +3216,7 @@ function ResumeProfile({ profile, loading, error, discipline, T, collapsedByDefa
           <div>
             <div style={{ fontSize: 14, fontWeight: 600, color: T.textBright }}>Your profile</div>
             <div style={{ fontSize: 12, color: T.textMuted }}>
-              {(MARKET_INTEL[profile.discipline]?.label || "")}{profile.seniority ? " \u00B7 " + profile.seniority : ""}{profile.years_experience ? " \u00B7 " + profile.years_experience + " yrs" : ""}
+              {(intel?.label || "")}{profile.seniority ? " \u00B7 " + profile.seniority : ""}{profile.years_experience ? " \u00B7 " + profile.years_experience + " yrs" : ""}
             </div>
           </div>
         </div>
@@ -2648,10 +3279,11 @@ function ResumeProfile({ profile, loading, error, discipline, T, collapsedByDefa
               <div style={{ fontSize: 10, color: T.textMuted, textTransform: "uppercase", letterSpacing: "0.06em", fontWeight: 600, marginBottom: 4 }}>
                 Your resume vs. {intel.label} postings (all levels)
               </div>
-              <div style={{ fontSize: 11, color: T.textDim, marginBottom: 16, lineHeight: 1.5 }}>
+              <div style={{ fontSize: 11, color: T.textDim, marginBottom: 4, lineHeight: 1.5 }}>
                 Compared against the dimensions Meridian tracks across all active {intel.label} postings. Checked items appear in your resume. Percentages show how often each is requested.
                 {profile.seniority && " Your profile reads as " + profile.seniority + "-level; the method and skill frequencies below reflect the full market, not a single level, since most postings require the same core set regardless of seniority."}
               </div>
+              <Provenance intel={intel} T={T} style={{ marginBottom: 16 }} />
 
               {/* Summary row */}
               <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: 12, marginBottom: 20 }}>
@@ -2862,6 +3494,215 @@ function UploadZone({ accept, label, hint, fileName, onFile, onClear, extracting
   );
 }
 
+// ─── SAVED JOBS / TRACKER (Part 3A) — localStorage, no backend ─────────────
+const SAVED_JOBS_KEY = "tailor_saved_jobs";
+const JOB_STATUSES = ["saved", "applied", "interviewing", "offered", "rejected", "withdrawn"];
+const JOB_STATUS_LABELS = { saved: "Saved", applied: "Applied", interviewing: "Interviewing", offered: "Offered", rejected: "Rejected", withdrawn: "Withdrawn" };
+
+function loadSavedJobs() {
+  try {
+    const raw = localStorage.getItem(SAVED_JOBS_KEY);
+    if (!raw) return [];
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed : [];
+  } catch (e) {
+    return [];
+  }
+}
+function persistSavedJobs(jobs) {
+  try { localStorage.setItem(SAVED_JOBS_KEY, JSON.stringify(jobs)); } catch (e) { /* storage unavailable or full — silently skip */ }
+}
+
+function jobStatusColor(status, T) {
+  return ({
+    saved: T.textMuted, applied: T.accentInk, interviewing: T.warning,
+    offered: T.success, rejected: T.danger, withdrawn: T.textDim,
+  })[status] || T.textMuted;
+}
+
+function StatusBadge({ status, T }) {
+  return (
+    <span style={{
+      display: "inline-block", padding: "3px 9px", borderRadius: 6,
+      fontSize: 10, fontWeight: 700, color: "#fff", background: jobStatusColor(status, T),
+      textTransform: "uppercase", letterSpacing: "0.03em", whiteSpace: "nowrap",
+    }}>
+      {JOB_STATUS_LABELS[status] || status}
+    </span>
+  );
+}
+
+// ─── SEARCH STRATEGY ANALYTICS (Part 2E) — deterministic, from saved jobs ───
+function TargetingInsights({ jobs, applicantSeniority, intel, T }) {
+  const total = jobs.length;
+  const cautionCount = jobs.filter(j => j.postingQualityVerdict === "Proceed with caution").length;
+  const highReqCount = jobs.filter(j => j.aboveP75Requirements).length;
+  const belowMarketCount = jobs.filter(j => j.salaryVerdict === "below").length;
+
+  const senCounts = {};
+  jobs.forEach(j => { if (j.seniority) senCounts[j.seniority] = (senCounts[j.seniority] || 0) + 1; });
+  const senLevels = Object.keys(senCounts).sort((a, b) => senCounts[b] - senCounts[a]);
+
+  const funnel = { saved: 0, applied: 0, interviewing: 0, offered: 0, rejected: 0, withdrawn: 0 };
+  jobs.forEach(j => { funnel[j.status] = (funnel[j.status] || 0) + 1; });
+
+  return (
+    <div>
+      {intel && <Provenance intel={intel} T={T} style={{ marginBottom: 12 }} />}
+      <SectionLabel T={T}>Targeting profile</SectionLabel>
+      <Card T={T} style={{ marginBottom: 16 }}>
+        <div style={{ fontSize: 13, color: T.textBright, lineHeight: 1.65, marginBottom: cautionCount / total > 0.4 ? 8 : 0 }}>
+          {cautionCount} of {total} saved postings scored "Proceed with caution" on posting quality.
+          {highReqCount > 0 && " " + highReqCount + " of " + total + " ask for more than typical for their level."}
+          {belowMarketCount > 0 && " " + belowMarketCount + " of " + total + " pay below market for their level."}
+        </div>
+        {cautionCount / total > 0.4 && (
+          <div style={{ fontSize: 12, color: T.warning, lineHeight: 1.5 }}>
+            If response rates are low, your targeting may be harder than the market average — not your materials.
+          </div>
+        )}
+      </Card>
+
+      <SectionLabel T={T}>Level consistency</SectionLabel>
+      <Card T={T} style={{ marginBottom: 16, padding: "16px 18px" }}>
+        {senLevels.length === 0 ? (
+          <div style={{ fontSize: 13, color: T.textMuted }}>No seniority data captured on your saved jobs yet.</div>
+        ) : (
+          <div>
+            {senLevels.map(s => (
+              <BarStat key={s} label={s} pct={Math.round((senCounts[s] / total) * 100)} highlight={s === applicantSeniority} T={T} />
+            ))}
+            {applicantSeniority && (
+              <div style={{ fontSize: 12, color: T.textMuted, marginTop: 8 }}>
+                Your profile reads as {applicantSeniority}-level (highlighted above). A saved-jobs mix skewed well above or below this may mean you're targeting the wrong level.
+              </div>
+            )}
+          </div>
+        )}
+      </Card>
+
+      <SectionLabel T={T}>Status funnel</SectionLabel>
+      <Card T={T}>
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: 10 }}>
+          {JOB_STATUSES.map(s => (
+            <div key={s} style={{ textAlign: "center", background: T.bgSubtle, borderRadius: 8, padding: "10px 6px" }}>
+              <div style={{ fontSize: 18, fontWeight: 700, color: T.textBright }}>{funnel[s] || 0}</div>
+              <div style={{ fontSize: 10, color: T.textMuted, marginTop: 2 }}>{JOB_STATUS_LABELS[s]}</div>
+            </div>
+          ))}
+        </div>
+      </Card>
+      <div style={{ fontSize: 10.5, color: T.textDim, marginTop: 8 }}>
+        Deterministic — computed from your saved jobs and each posting's quality verdict, captured at the time you saved it.
+      </div>
+    </div>
+  );
+}
+
+function SavedJobsPanel({ jobs, applicantSeniority, intel, onClose, onRestore, onDelete, onStatusChange, T }) {
+  const [filter, setFilter] = useState("all");
+  const [view, setView] = useState("list");
+  const [confirmDeleteId, setConfirmDeleteId] = useState(null);
+
+  const filtered = filter === "all" ? jobs : jobs.filter(j => j.status === filter);
+  const sorted = filtered.slice().sort((a, b) => new Date(b.dateAdded) - new Date(a.dateAdded));
+
+  return (
+    <div style={{
+      position: "fixed", inset: 0, zIndex: 999,
+      background: "rgba(0,0,0,0.45)", display: "flex",
+      alignItems: "center", justifyContent: "center",
+    }} onClick={onClose}>
+      <div style={{
+        background: T.bgCard, borderRadius: 12, padding: "24px 28px",
+        maxWidth: 640, width: "92%", maxHeight: "85vh", overflowY: "auto",
+        boxShadow: T.shadowHover, border: "1px solid " + T.border,
+      }} onClick={e => e.stopPropagation()}>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 16 }}>
+          <div style={{ fontSize: 16, fontWeight: 700, color: T.textBright }}>Saved jobs ({jobs.length})</div>
+          <button onClick={onClose} style={{ background: "none", border: "none", color: T.textMuted, cursor: "pointer", fontSize: 20, fontFamily: T.font, lineHeight: 1 }}>×</button>
+        </div>
+
+        {jobs.length >= 5 && (
+          <TabBar tabs={[{ id: "list", label: "Jobs" }, { id: "insights", label: "Insights" }]} active={view} onChange={setView} T={T} />
+        )}
+
+        {view === "list" && (
+          <div>
+            <div style={{ display: "flex", flexWrap: "wrap", gap: 6, marginBottom: 14 }}>
+              {["all"].concat(JOB_STATUSES).map(s => (
+                <button key={s} onClick={() => setFilter(s)} style={{
+                  padding: "4px 10px", fontSize: 11, borderRadius: 6, fontFamily: T.font, cursor: "pointer",
+                  border: "1px solid " + (filter === s ? T.accent : T.border),
+                  background: filter === s ? T.accentSoft : "transparent",
+                  color: filter === s ? T.accentInk : T.textMuted, fontWeight: filter === s ? 600 : 400,
+                }}>
+                  {s === "all" ? "All" : JOB_STATUS_LABELS[s]}
+                </button>
+              ))}
+            </div>
+
+            {sorted.length === 0 && (
+              <div style={{ fontSize: 13, color: T.textMuted }}>No saved jobs{filter !== "all" ? " with this status" : ""} yet.</div>
+            )}
+
+            {sorted.map(job => (
+              <Card key={job.id} T={T} style={{ marginBottom: 10 }}>
+                <div style={{ display: "flex", justifyContent: "space-between", gap: 10, alignItems: "flex-start" }}>
+                  <div style={{ flex: 1, minWidth: 0, cursor: "pointer" }} onClick={() => onRestore(job)}>
+                    <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
+                      <span style={{ fontSize: 13, fontWeight: 600, color: T.textBright }}>{job.jobTitle || "Untitled posting"}</span>
+                      <StatusBadge status={job.status} T={T} />
+                    </div>
+                    <div style={{ fontSize: 12, color: T.textMuted, marginTop: 2 }}>
+                      {job.company || "Unknown company"}{job.seniority ? " · " + job.seniority : ""}
+                    </div>
+                    <div style={{ fontSize: 11, color: T.textDim, marginTop: 4 }}>
+                      Saved {new Date(job.dateAdded).toLocaleDateString()}
+                      {job.dateApplied && " · Applied " + new Date(job.dateApplied).toLocaleDateString()}
+                      {job.postingQualityVerdict && " · " + job.postingQualityVerdict}
+                    </div>
+                    {job.provenanceSnapshot && (
+                      <div style={{ fontSize: 10.5, color: T.textDim, marginTop: 3, fontStyle: job.provenanceSnapshot.live ? "normal" : "italic" }}>
+                        {job.provenanceSnapshot.live
+                          ? "Meridian · " + (job.provenanceSnapshot.postingCount != null ? job.provenanceSnapshot.postingCount + " postings" : "live") + " at save time"
+                          : "Illustrative market data at save time"}
+                      </div>
+                    )}
+                  </div>
+                  <div style={{ display: "flex", flexDirection: "column", alignItems: "flex-end", gap: 6, flexShrink: 0 }}>
+                    <select
+                      value={job.status}
+                      onChange={e => onStatusChange(job.id, e.target.value)}
+                      onClick={e => e.stopPropagation()}
+                      style={{
+                        fontFamily: T.font, fontSize: 11, padding: "3px 6px", borderRadius: 6,
+                        border: "1px solid " + T.borderStrong, background: T.bgInput, color: T.textBright,
+                      }}
+                    >
+                      {JOB_STATUSES.map(s => <option key={s} value={s}>{JOB_STATUS_LABELS[s]}</option>)}
+                    </select>
+                    {confirmDeleteId === job.id ? (
+                      <div style={{ display: "flex", gap: 4 }} onClick={e => e.stopPropagation()}>
+                        <button onClick={() => onDelete(job.id)} style={{ fontSize: 10, color: "#fff", background: T.danger, border: "none", borderRadius: 5, padding: "3px 8px", cursor: "pointer", fontFamily: T.font }}>Confirm</button>
+                        <button onClick={() => setConfirmDeleteId(null)} style={{ fontSize: 10, color: T.textMuted, background: "none", border: "1px solid " + T.border, borderRadius: 5, padding: "3px 8px", cursor: "pointer", fontFamily: T.font }}>Cancel</button>
+                      </div>
+                    ) : (
+                      <button onClick={e => { e.stopPropagation(); setConfirmDeleteId(job.id); }} style={{ fontSize: 11, color: T.danger, background: "none", border: "none", cursor: "pointer", fontFamily: T.font }}>Delete</button>
+                    )}
+                  </div>
+                </div>
+              </Card>
+            ))}
+          </div>
+        )}
+
+        {view === "insights" && <TargetingInsights jobs={jobs} applicantSeniority={applicantSeniority} intel={intel} T={T} />}
+      </div>
+    </div>
+  );
+}
+
 // ─── MAIN ───────────────────────────────────────────────────────────────────
 function Tailor() {
   const [theme, setTheme] = useState("light");
@@ -2916,6 +3757,97 @@ function Tailor() {
   const [showSettings, setShowSettings] = useState(false);
   const abortRef = useRef(null);
 
+  // ── Live market data (Part 1) ──
+  // Keyed by discipline: { status: "loading"|"ready"|"error", data: {...}|null }.
+  // Fetched once per discipline per session and cached here; mergeIntel()
+  // overlays it onto FALLBACK_INTEL field-by-field so a partial live response
+  // still improves on pure fallback data.
+  const [marketByDiscipline, setMarketByDiscipline] = useState({});
+  const marketFetchedRef = useRef({});
+  const fetchMarket = useCallback((disc) => {
+    if (!FALLBACK_INTEL[disc] || marketFetchedRef.current[disc]) return;
+    marketFetchedRef.current[disc] = true;
+    setMarketByDiscipline(prev => ({ ...prev, [disc]: { status: "loading", data: null } }));
+    fetch("/api/market?discipline=" + disc)
+      .then(r => { if (!r.ok) throw new Error("market fetch failed: " + r.status); return r.json(); })
+      .then(data => setMarketByDiscipline(prev => ({ ...prev, [disc]: { status: "ready", data } })))
+      .catch(() => setMarketByDiscipline(prev => ({ ...prev, [disc]: { status: "error", data: null } })));
+  }, []);
+  const getIntel = useCallback((disc) => mergeIntel(disc, marketByDiscipline), [marketByDiscipline]);
+
+  useEffect(() => { fetchMarket(discipline); }, [discipline, fetchMarket]);
+  useEffect(() => { if (profile && profile.discipline) fetchMarket(profile.discipline); }, [profile && profile.discipline, fetchMarket]);
+
+  // ── Saved jobs / tracker (Part 3A) ──
+  const [savedJobs, setSavedJobs] = useState(() => loadSavedJobs());
+  const [showSavedJobs, setShowSavedJobs] = useState(false);
+  const currentJobSaved = savedJobs.some(j => j.jobText === jobText);
+
+  const saveCurrentJob = useCallback(() => {
+    if (!jobText.trim() || currentJobSaved) return;
+    const intel = getIntel(discipline);
+    const quality = assessPostingQuality(jobDims, intel);
+    const comparison = jobDims && intel ? compareJobToMarket(jobDims, intel) : null;
+    const entry = {
+      id: (Date.now().toString(36) + Math.random().toString(36).slice(2)),
+      jobTitle: (jobDims && jobDims.posting_title) || jobText.split(/\r?\n/)[0].slice(0, 80) || "Untitled posting",
+      company: (jobDims && jobDims.company) || "",
+      jobText,
+      dateAdded: new Date().toISOString(),
+      dateApplied: null,
+      status: "saved",
+      discipline,
+      seniority: (jobDims && jobDims.seniority) || seniority,
+      postingQualityVerdict: quality ? quality.verdict : null,
+      aboveP75Requirements: !!(quality && quality.checks.some(c => c.id === "requirements" && c.status === "fail")),
+      salaryVerdict: comparison && comparison.salary ? comparison.salary.verdict : null,
+      provenanceSnapshot: intel && intel.provenance ? intel.provenance : null,
+      cachedAnalysis: { jobDims, results },
+    };
+    setSavedJobs(prev => {
+      const next = prev.concat(entry);
+      persistSavedJobs(next);
+      return next;
+    });
+  }, [jobText, currentJobSaved, getIntel, discipline, jobDims, seniority, results]);
+
+  const updateJobStatus = useCallback((id, status) => {
+    setSavedJobs(prev => {
+      const next = prev.map(j => {
+        if (j.id !== id) return j;
+        const updated = { ...j, status };
+        if (status === "applied" && !j.dateApplied) updated.dateApplied = new Date().toISOString();
+        return updated;
+      });
+      persistSavedJobs(next);
+      return next;
+    });
+  }, []);
+
+  const deleteJob = useCallback((id) => {
+    setSavedJobs(prev => {
+      const next = prev.filter(j => j.id !== id);
+      persistSavedJobs(next);
+      return next;
+    });
+  }, []);
+
+  const restoreJob = useCallback((job) => {
+    setJobText(job.jobText);
+    setDiscipline(job.discipline || "uxr");
+    if (job.seniority) setSeniority(job.seniority);
+    const cached = job.cachedAnalysis || {};
+    setJobDims(cached.jobDims || null);
+    if (cached.results) {
+      setResults(cached.results);
+      setStep("results");
+      setActiveTab("strategy");
+    } else {
+      setStep("input");
+    }
+    setShowSavedJobs(false);
+  }, []);
+
   const T = theme === "dark" ? DARK_TOKENS : LIGHT_TOKENS;
   const isReady = setupStep === "ready";
 
@@ -2924,10 +3856,10 @@ function Tailor() {
   const atsResult = useMemo(() => {
     if (!resumeText || resumeText.trim().length < 50) return null;
     return assessATS(resumeText, {
-      intel: MARKET_INTEL[(profile && profile.discipline) || discipline],
+      intel: getIntel((profile && profile.discipline) || discipline),
       jobText: jobText,
     });
-  }, [resumeText, profile, discipline, jobText]);
+  }, [resumeText, profile, discipline, jobText, getIntel]);
 
   // Deterministic positioning strategy. Recomputes when profile, job text,
   // or discipline changes. No AI involved.
@@ -2936,10 +3868,10 @@ function Tailor() {
     return buildPositioningStrategy(
       profile,
       jobText,
-      MARKET_INTEL[(profile && profile.discipline) || discipline],
+      getIntel((profile && profile.discipline) || discipline),
       jobDims
     );
-  }, [profile, jobText, discipline, jobDims]);
+  }, [profile, jobText, discipline, jobDims, getIntel]);
 
   // Deterministic resume customizations specific to this posting.
   const resumeCustomizations = useMemo(() => {
@@ -2948,9 +3880,53 @@ function Tailor() {
       profile,
       jobText,
       resumeText,
-      MARKET_INTEL[(profile && profile.discipline) || discipline]
+      getIntel((profile && profile.discipline) || discipline),
+      (profile && profile.discipline) || discipline
     );
-  }, [profile, jobText, resumeText, discipline]);
+  }, [profile, jobText, resumeText, discipline, getIntel]);
+
+  // Deterministic responsibility alignment (Part 3B) — this posting's stated
+  // responsibilities matched against the resume's stated outcomes.
+  const responsibilityAlignment = useMemo(() => {
+    if (!jobDims || !jobDims.responsibilities || !resumeText) return null;
+    return matchResponsibilities(jobDims.responsibilities, resumeText, profile && profile.responsibilities);
+  }, [jobDims, resumeText, profile]);
+
+  // ── Intersectional rarity hook (Part 2D) ──
+  // Once the top 2-3 differentiators for this posting are known, ask
+  // /api/rarity what share of the corpus asks for all of them together. A
+  // rare-enough combination becomes a Strategy-tab hook. Silently skipped on
+  // any failure — this is a bonus insight, never a blocker.
+  const [rarityHook, setRarityHook] = useState(null);
+  const rarityRequestRef = useRef("");
+  useEffect(() => {
+    if (!positioningStrategy || !positioningStrategy.leadWith || positioningStrategy.leadWith.length < 2) {
+      setRarityHook(null);
+      return;
+    }
+    const skills = positioningStrategy.leadWith.slice(0, 3).map(m => m.method);
+    const requestKey = discipline + "|" + skills.join("|");
+    if (rarityRequestRef.current === requestKey) return;
+    rarityRequestRef.current = requestKey;
+    setRarityHook(null);
+    fetch("/api/rarity", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ discipline, skills }),
+    })
+      .then(r => { if (!r.ok) throw new Error("rarity fetch failed"); return r.json(); })
+      .then(data => {
+        if (data && typeof data.pctRequiringAll === "number" && data.pctRequiringAll <= 15) {
+          setRarityHook({
+            theme: "A rare intersection",
+            insight: "The combination of " + skills.join(" + ") + " appears together in only " + data.pctRequiringAll + "% of " + (getIntel(discipline)?.label || "") + " postings — and this one wants all of them. You're in a rare intersection. Make it the spine of your positioning.",
+          });
+        } else {
+          setRarityHook(null);
+        }
+      })
+      .catch(() => setRarityHook(null));
+  }, [positioningStrategy, discipline, getIntel]);
 
   useEffect(() => {
     if (typeof document !== "undefined" && document.body) {
@@ -2978,7 +3954,9 @@ function Tailor() {
         "Keys: discipline (uxr or design or pm), seniority, seniority_rationale, " +
         "years_experience, methods (array), tools (array), soft_skills (array), " +
         "degree_level, degree_field, ai_experience (bool), ai_context, " +
-        "industries (array), specializations (array), summary.\n\n" + excerpt;
+        "industries (array), specializations (array), summary, " +
+        "responsibilities (array of 5-8 stated outcomes/duties from the experience section, in the resume's own words), " +
+        "impact_indicators (array of quantified achievements found in the resume, e.g. '40% increase in adoption', 'led a team of 6' — empty array if none).\n\n" + excerpt;
     };
 
     const budgets = [2500];
@@ -3008,7 +3986,7 @@ function Tailor() {
       // Prime the seniority used for market comparisons from the resume, unless a
       // job description later overrides it.
       if (parsed.seniority) setSeniority(parsed.seniority);
-      if (parsed.discipline && MARKET_INTEL[parsed.discipline]) setDiscipline(parsed.discipline);
+      if (parsed.discipline && FALLBACK_INTEL[parsed.discipline]) setDiscipline(parsed.discipline);
     } catch (err) {
       if (err.name === "AbortError") return;
       const detail = (err && err.message ? err.message : String(err));
@@ -3071,6 +4049,11 @@ function Tailor() {
       "salary_min (number or null), salary_max (number or null), " +
       "years_required (number \u2014 the minimum years of experience explicitly required, best estimate), " +
       "required_methods (array of specific methods or tools explicitly required, not nice-to-haves), " +
+      "required_skills (array of specific soft skills or qualities explicitly required, not nice-to-haves), " +
+      "responsibilities (array of 3-8 verb-first duties this posting states, in its own words), " +
+      "posting_title (the job title as stated, or null), " +
+      "company (the company or organization name as stated, or null), " +
+      "mission (one sentence describing the company's mission or what it does, only if the posting states it, or null), " +
       "degree_required (bool), remote_allowed (bool).\n\n" + excerptLabel(budget) + "\n\n" + full.slice(0, budget);
 
     // Small helper text so the model knows this may be a partial excerpt.
@@ -3223,7 +4206,7 @@ function Tailor() {
     setError(null);
     setResults(null);
 
-    const intel = MARKET_INTEL[discipline];
+    const intel = getIntel(discipline);
     const salaryRange = intel.salaryRanges[seniority];
 
     const fullJob = sanitizeText(jobText);
@@ -3337,7 +4320,7 @@ function Tailor() {
       }
       setStep("input");
     }
-  }, [jobText, resumeText, voiceText, discipline, seniority, profile, atsResult]);
+  }, [jobText, resumeText, voiceText, discipline, seniority, profile, atsResult, getIntel]);
 
   // ── Generate cover letter on demand (not automatically) ──
   const [coverGenerating, setCoverGenerating] = useState(false);
@@ -3572,6 +4555,45 @@ function Tailor() {
             </span>
           </button>
 
+          {/* Saved jobs / tracker */}
+          {isReady && (
+            <button
+              onClick={() => setShowSavedJobs(true)}
+              style={{
+                fontFamily: T.font, fontSize: 12, fontWeight: 600, cursor: "pointer",
+                color: T.textMuted, background: "transparent", display: "flex", alignItems: "center", gap: 6,
+                border: "1px solid " + T.border, padding: "5px 10px", borderRadius: 7,
+              }}
+            >
+              Saved jobs
+              {savedJobs.length > 0 && (
+                <span style={{
+                  display: "inline-flex", alignItems: "center", justifyContent: "center",
+                  minWidth: 16, height: 16, borderRadius: 8, padding: "0 4px",
+                  background: T.accent, color: "#fff", fontSize: 10, fontWeight: 700,
+                }}>
+                  {savedJobs.length}
+                </span>
+              )}
+            </button>
+          )}
+
+          {/* Save this job */}
+          {step === "results" && (
+            <button
+              onClick={saveCurrentJob}
+              disabled={currentJobSaved}
+              style={{
+                fontFamily: T.font, fontSize: 12, fontWeight: 600,
+                cursor: currentJobSaved ? "default" : "pointer",
+                color: currentJobSaved ? T.success : T.textMuted, background: "transparent",
+                border: "1px solid " + (currentJobSaved ? T.success + "55" : T.border), padding: "5px 10px", borderRadius: 7,
+              }}
+            >
+              {currentJobSaved ? "✓ Saved" : "Save this job"}
+            </button>
+          )}
+
           {/* Settings */}
           {isReady && (
             <button
@@ -3628,6 +4650,20 @@ function Tailor() {
             </div>
           </div>
         </div>
+      )}
+
+      {/* ── SAVED JOBS MODAL ────────────────────────────────────────── */}
+      {showSavedJobs && (
+        <SavedJobsPanel
+          jobs={savedJobs}
+          applicantSeniority={profile && profile.seniority}
+          intel={getIntel(discipline)}
+          onClose={() => setShowSavedJobs(false)}
+          onRestore={restoreJob}
+          onDelete={deleteJob}
+          onStatusChange={updateJobStatus}
+          T={T}
+        />
       )}
 
       {/* ── SETTINGS MODAL ──────────────────────────────────────────── */}
@@ -3768,7 +4804,7 @@ function Tailor() {
                     </button>
                   </div>
                   <div style={{ fontSize: 13, color: T.textMuted, marginBottom: 16, lineHeight: 1.6 }}>
-                    Tailor reads your resume and assesses it across the same dimensions the market tracks. This stays local and is only used to generate tailored application materials.
+                    Your resume is the persistent base document — upload it once and it stays loaded across every posting you analyze. Tailor reads it and assesses it across the same dimensions the market tracks. This stays local and is only used to generate tailored application materials.
                   </div>
 
                   {resumePasteMode ? (
@@ -3814,6 +4850,7 @@ function Tailor() {
                     loading={profileLoading}
                     error={profileError}
                     discipline={discipline}
+                    getIntel={getIntel}
                     T={T}
                     collapsedByDefault={false}
                   />
@@ -3849,7 +4886,7 @@ function Tailor() {
                     </button>
                   </div>
                   <div style={{ fontSize: 13, color: T.textMuted, marginBottom: 16, lineHeight: 1.6 }}>
-                    A voice profile describes your writing style, tone, and preferences. When provided, the cover letter Tailor generates will match how you actually write. You can skip this and add one later in Settings.
+                    A voice profile describes your writing style, tone, and preferences. Like your resume, it stays loaded across every posting you analyze and shapes the writing guidance you get — not just a generated draft. You can skip this and add one later in Settings.
                   </div>
 
                   {voicePasteMode ? (
@@ -3943,6 +4980,7 @@ function Tailor() {
               loading={profileLoading}
               error={profileError}
               discipline={discipline}
+              getIntel={getIntel}
               T={T}
               collapsedByDefault={false}
             />
@@ -3955,7 +4993,7 @@ function Tailor() {
                   background: T.accentSoft, color: T.accentInk,
                   border: "1px solid " + T.accent + "33",
                 }}>
-                  {MARKET_INTEL[discipline]?.label || "UX Research"}
+                  {getIntel(discipline)?.label || "UX Research"}
                 </span>
                 <span style={{
                   padding: "5px 12px", borderRadius: 6, fontSize: 12, fontWeight: 500,
@@ -3970,6 +5008,11 @@ function Tailor() {
               </div>
             )}
 
+            {jobText.length === 0 && (
+              <div style={{ fontSize: 12, color: T.textMuted, marginBottom: 10, lineHeight: 1.6 }}>
+                Paste a posting below to see how it compares against the live market and get a positioning strategy built from your resume and this specific role.
+              </div>
+            )}
             <SectionLabel T={T}>Job description</SectionLabel>
             <TextArea
               value={jobText} onChange={setJobText} T={T} rows={14}
@@ -3988,7 +5031,7 @@ function Tailor() {
                   jobDims={jobDims}
                   jobDimsLoading={jobDimsLoading}
                   jobDimsError={jobDimsError}
-                  intel={MARKET_INTEL[discipline]}
+                  intel={getIntel(discipline)}
                   jobTextLength={jobText.length}
                   T={T}
                 />
@@ -4009,15 +5052,15 @@ function Tailor() {
         )}
 
         {/* LOADING */}
-        {isReady && step === "loading" && <LoadingView discipline={discipline} T={T} />}
+        {isReady && step === "loading" && <LoadingView discipline={discipline} intelLabel={getIntel(discipline)?.label} T={T} />}
 
         {/* RESULTS */}
         {isReady && step === "results" && results && (
           <div>
-            {activeTab === "strategy" && <PositioningTab strategy={positioningStrategy} positionStrength={results.position_strength} talkingPoints={results.talking_points} T={T} />}
-            {activeTab === "cover" && <CoverLetterTab coverLetter={results.cover_letter} onGenerate={generateCoverLetter} generating={coverGenerating} onRegenerate={regenerateCoverLetter} regenerating={regenerating} T={T} />}
+            {activeTab === "strategy" && <PositioningTab strategy={positioningStrategy} positionStrength={results.position_strength} talkingPoints={results.talking_points} rarityHook={rarityHook} responsibilityAlignment={responsibilityAlignment} intel={getIntel((profile && profile.discipline) || discipline)} T={T} />}
+            {activeTab === "cover" && <CoverLetterTab coverLetter={results.cover_letter} onGenerate={generateCoverLetter} generating={coverGenerating} onRegenerate={regenerateCoverLetter} regenerating={regenerating} jobDims={jobDims} strategy={positioningStrategy} rarityHook={rarityHook} voiceSummary={voiceSummary} T={T} />}
             {activeTab === "resume" && <ResumeTab suggestions={results.suggestions} talkingPoints={results.talking_points} resumeText={resumeText} onReword={rewordSuggestion} rewordingIdx={rewordingIdx} atsResult={atsResult} customizations={resumeCustomizations} T={T} />}
-            {activeTab === "market" && <MarketIntelTab discipline={discipline} seniority={seniority} jobText={jobText} jobDims={jobDims} jobDimsLoading={jobDimsLoading} jobDimsError={jobDimsError} T={T} />}
+            {activeTab === "market" && <MarketIntelTab discipline={discipline} seniority={seniority} jobText={jobText} jobDims={jobDims} jobDimsLoading={jobDimsLoading} jobDimsError={jobDimsError} intel={getIntel(discipline)} T={T} />}
           </div>
         )}
       </div>
