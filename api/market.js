@@ -7,7 +7,7 @@
 //
 // Env vars required (server-side only, never exposed to the browser):
 //   SUPABASE_URL, SUPABASE_SERVICE_KEY
-const { fetchDiscipline } = require("./_lib/supabase");
+const { fetchDiscipline, fetchRows } = require("./_lib/supabase");
 const { DISCIPLINES, canonicalMethodName, toolsInRecord, respThemeCounts, SENIORITY_ORDER, normalizeSeniorityForTailor, percentile } = require("./_lib/taxonomy");
 
 const DAY_MS = 24 * 60 * 60 * 1000;
@@ -226,6 +226,28 @@ module.exports = async function handler(req, res) {
   const config = DISCIPLINES[discipline];
   if (!config) {
     res.status(400).json({ error: "Unknown or missing discipline. Use uxr, design, or pm." });
+    return;
+  }
+
+  // TEMPORARY diagnostic: metadata only, never raw content. Remove once the
+  // design/pm reassembly issue is root-caused.
+  if (req.query.debug === "diag") {
+    try {
+      const rows = await fetchRows(config.storageKey);
+      const combined = rows.map((r) => r.value).join("");
+      let parseError = null;
+      try { JSON.parse(combined); } catch (e) { parseError = e.message; }
+      res.status(200).json({
+        rowCount: rows.length,
+        idxFirst: rows[0].idx,
+        idxLast: rows[rows.length - 1].idx,
+        updatedAts: rows.map((r) => r.updated_at),
+        totalLength: combined.length,
+        parseError,
+      });
+    } catch (err) {
+      res.status(500).json({ error: (err && err.message) || "diag failed" });
+    }
     return;
   }
 
