@@ -24,12 +24,34 @@ async function fetchRows(storageKey) {
   return rows;
 }
 
+// A single logical value's chunks are written in one batch: idx 0..N-1,
+// contiguous, all in the same fraction of a second. In production some keys
+// (design, pm) carry orphaned chunks from an earlier or partial write that
+// were never cleaned up — they always sit past a gap in idx and carry a
+// different updated_at. Concatenating past that point corrupts the JSON, so
+// reassembly stops at the first index gap or timestamp jump (>60s from the
+// first chunk) rather than trusting every row returned for the key.
+const STALE_CHUNK_WINDOW_MS = 60 * 1000;
+
+function currentValueRows(rows) {
+  const refTime = new Date(rows[0].updated_at).getTime();
+  const valid = [];
+  for (let i = 0; i < rows.length; i++) {
+    if (rows[i].idx !== i) break;
+    if (Math.abs(new Date(rows[i].updated_at).getTime() - refTime) > STALE_CHUNK_WINDOW_MS) break;
+    valid.push(rows[i]);
+  }
+  return valid;
+}
+
 async function fetchDiscipline(storageKey) {
   const rows = await fetchRows(storageKey);
-  const combined = rows.map((r) => r.value).join("");
+  const current = currentValueRows(rows);
+  if (!current.length) throw new Error("No contiguous data found for key " + storageKey);
+  const combined = current.map((r) => r.value).join("");
   const parsed = JSON.parse(combined);
   const jobs = Array.isArray(parsed) ? parsed : Array.isArray(parsed.jobs) ? parsed.jobs : [];
   return jobs;
 }
 
-module.exports = { fetchDiscipline, fetchRows };
+module.exports = { fetchDiscipline, fetchRows, currentValueRows };
