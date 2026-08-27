@@ -1369,8 +1369,179 @@ function buildResumeCustomizations(profile, jobText, resumeText, intel, discipli
   return customizations.length > 0 ? customizations : null;
 }
 
+// ─── NETWORKING (deterministic — no AI) ─────────────────────────────────────
+// Built entirely from jobDims (company, team_name, seniority) and the
+// discipline label. Nothing here is generated; the guidance text is static.
+const NETWORKING_MANAGER_TITLE_GUESS = {
+  Intern: ["Manager", "Lead"], Entry: ["Manager", "Lead"], Mid: ["Manager", "Lead"],
+  Senior: ["Manager", "Head of"], Lead: ["Manager", "Director"], Staff: ["Manager", "Director"],
+  Principal: ["Director", "Head of"], Manager: ["Director", "Head of"],
+  Director: ["VP", "Head of"], VP: ["Head of", "Chief"], Head: ["Chief", "VP"],
+};
+function guessHiringManagerTitles(seniority) {
+  return NETWORKING_MANAGER_TITLE_GUESS[seniority] || ["Manager", "Head of"];
+}
+
+function buildNetworkingRoleTypes(jobDims, disciplineLabel) {
+  const company = jobDims.company;
+  const team = jobDims.team_name;
+  const [guess1, guess2] = guessHiringManagerTitles(jobDims.seniority);
+  const teamPhrase = team ? " on the " + team + " team" : "";
+  return [
+    {
+      title: "The hiring manager",
+      detail: "Search for “" + guess1 + "” or “" + guess2 + "” + “" + disciplineLabel + "” at " + company + teamPhrase + ".",
+      why: "This person decides. A warm intro here changes your odds more than anything on your resume.",
+    },
+    {
+      title: "Current team members",
+      detail: "Peers at the same or adjacent level" + (team ? " on the " + team + " team" : " in " + disciplineLabel) + " at " + company + ".",
+      why: "They can tell you what the team actually needs day-to-day, which tells you what to emphasize in your materials.",
+    },
+    {
+      title: "The recruiter",
+      detail: "Often tagged on the LinkedIn posting itself, or searchable as “Recruiter” + " + company + ".",
+      why: "Recruiters are measured on pipeline — a qualified candidate reaching out directly is welcome, not annoying.",
+    },
+    {
+      title: "Former employees",
+      detail: "Same team or function, who left " + company + " within the last 1–2 years.",
+      why: "Often the most candid source on culture, real expectations, and why the role is open.",
+    },
+  ];
+}
+
+function buildNetworkingQueries(jobDims, disciplineLabel) {
+  const company = jobDims.company;
+  const team = jobDims.team_name;
+  const [guess1] = guessHiringManagerTitles(jobDims.seniority);
+  const queries = [
+    { label: "Find the hiring manager", query: "\"" + company + "\" \"" + disciplineLabel + "\" \"" + guess1 + "\"" },
+  ];
+  if (team) queries.push({ label: "Find the team", query: "\"" + company + "\" \"" + team + "\"" });
+  queries.push({ label: "Find the recruiter", query: "\"" + company + "\" \"Recruiter\" OR \"Talent Acquisition\"" });
+  queries.push({ label: "Broad search", query: "\"" + company + "\" \"" + disciplineLabel + "\"" });
+  return queries;
+}
+
+const NETWORKING_DOS = [
+  "Reach out before you apply, not after — a referral submitted alongside your application is far more effective than one submitted after.",
+  "Lead with shared context: name the specific role, the team, and one thing about their work that caught your attention.",
+  "Mention one concrete differentiator from your Strategy tab — something specific to you, not a generic qualification.",
+  "Ask a genuine question about the team or the work rather than directly requesting a referral on first contact.",
+  "Keep it under 100 words — connection requests with short messages get accepted at 2–3x the rate of long ones.",
+];
+const NETWORKING_DONTS = [
+  "Use a template that reads like a template — if it could be sent to any company by swapping the name, it's too generic.",
+  "Ask for a referral in your first message — build the connection first, then ask.",
+  "Message more than 2–3 people at the same company — word gets around.",
+  "Follow up more than once if there's no response — silence is an answer.",
+];
+const NETWORKING_TIMING = [
+  "Best window: reach out 3–7 days before you plan to submit your application.",
+  "If you get a response and a conversation, ask if they'd be comfortable referring you — most people will if the conversation went well.",
+  "If no response after 5–7 days, one short follow-up is fine; after that, apply without the referral rather than waiting indefinitely.",
+];
+
+function NetworkingSection({ jobDims, intel, T }) {
+  if (!jobDims || !jobDims.company) return null;
+  const company = jobDims.company;
+  const disciplineLabel = (intel && intel.label) || "";
+  const roleTypes = buildNetworkingRoleTypes(jobDims, disciplineLabel);
+  const queries = buildNetworkingQueries(jobDims, disciplineLabel);
+
+  return (
+    <div style={{ marginTop: 24 }}>
+      <SectionLabel T={T}>Networking</SectionLabel>
+      <div style={{ fontSize: 12, color: T.textMuted, marginBottom: 16, lineHeight: 1.5 }}>
+        Tailor can't see your LinkedIn connections, but it can tell you exactly who to look for and what to say based on this specific posting.
+      </div>
+
+      <div style={{ marginBottom: 20 }}>
+        <div style={{ fontSize: 13, fontWeight: 600, color: T.textBright, marginBottom: 10 }}>
+          Who to look for at {company}
+        </div>
+        <Card T={T}>
+          {roleTypes.map((r, i) => (
+            <div key={i} style={{ padding: "10px 0", borderTop: i > 0 ? "1px solid " + T.border : "none" }}>
+              <div style={{ fontSize: 13, fontWeight: 600, color: T.textBright, marginBottom: 3 }}>{r.title}</div>
+              <div style={{ fontSize: 12, color: T.text, lineHeight: 1.5, marginBottom: 4 }}>{r.detail}</div>
+              <div style={{ fontSize: 12, color: T.textMuted, lineHeight: 1.5, fontStyle: "italic" }}>{r.why}</div>
+            </div>
+          ))}
+        </Card>
+      </div>
+
+      <div style={{ marginBottom: 20 }}>
+        <div style={{ fontSize: 13, fontWeight: 600, color: T.textBright, marginBottom: 10 }}>
+          Search queries to try
+        </div>
+        {queries.map((q, i) => (
+          <Card key={i} T={T} style={{ marginBottom: 8, padding: "12px 14px" }}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 10 }}>
+              <div style={{ minWidth: 0 }}>
+                <div style={{ fontSize: 10, color: T.textMuted, textTransform: "uppercase", letterSpacing: "0.06em", marginBottom: 4 }}>
+                  {q.label}
+                </div>
+                <div style={{ fontSize: 13, color: T.textBright, fontFamily: T.mono, wordBreak: "break-word" }}>
+                  {q.query}
+                </div>
+              </div>
+              <CopyBtn text={q.query} T={T} />
+            </div>
+          </Card>
+        ))}
+      </div>
+
+      <div style={{ marginBottom: 20 }}>
+        <div style={{ fontSize: 13, fontWeight: 600, color: T.textBright, marginBottom: 10 }}>
+          How to reach out
+        </div>
+        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }}>
+          <Card T={T}>
+            <div style={{ fontSize: 11, fontWeight: 700, color: T.success, textTransform: "uppercase", letterSpacing: "0.06em", marginBottom: 10 }}>
+              Do
+            </div>
+            {NETWORKING_DOS.map((d, i) => (
+              <div key={i} style={{ display: "flex", gap: 8, alignItems: "flex-start", padding: "6px 0", borderTop: i > 0 ? "1px solid " + T.border : "none" }}>
+                <span style={{ color: T.success, fontSize: 12, marginTop: 1, flexShrink: 0 }}>{"✓"}</span>
+                <span style={{ fontSize: 12, color: T.text, lineHeight: 1.5 }}>{d}</span>
+              </div>
+            ))}
+          </Card>
+          <Card T={T}>
+            <div style={{ fontSize: 11, fontWeight: 700, color: T.danger, textTransform: "uppercase", letterSpacing: "0.06em", marginBottom: 10 }}>
+              Don't
+            </div>
+            {NETWORKING_DONTS.map((d, i) => (
+              <div key={i} style={{ display: "flex", gap: 8, alignItems: "flex-start", padding: "6px 0", borderTop: i > 0 ? "1px solid " + T.border : "none" }}>
+                <span style={{ color: T.danger, fontSize: 12, marginTop: 1, flexShrink: 0 }}>{"×"}</span>
+                <span style={{ fontSize: 12, color: T.text, lineHeight: 1.5 }}>{d}</span>
+              </div>
+            ))}
+          </Card>
+        </div>
+      </div>
+
+      <div>
+        <div style={{ fontSize: 13, fontWeight: 600, color: T.textBright, marginBottom: 10 }}>
+          Timing
+        </div>
+        <Card T={T}>
+          {NETWORKING_TIMING.map((t, i) => (
+            <div key={i} style={{ display: "flex", gap: 10, alignItems: "flex-start", padding: "7px 0", borderTop: i > 0 ? "1px solid " + T.border : "none" }}>
+              <span style={{ color: T.accent, fontSize: 12, marginTop: 2, flexShrink: 0 }}>{"→"}</span>
+              <span style={{ fontSize: 12, color: T.textBright, lineHeight: 1.5 }}>{t}</span>
+            </div>
+          ))}
+        </Card>
+      </div>
+    </div>
+  );
+}
+
 // ─── POSITIONING STRATEGY TAB ───────────────────────────────────────────────
-function PositioningTab({ strategy, positionStrength, talkingPoints, rarityHook, responsibilityAlignment, intel, T }) {
+function PositioningTab({ strategy, positionStrength, talkingPoints, rarityHook, responsibilityAlignment, intel, jobDims, T }) {
   if (!strategy) return <div style={{ color: T.textMuted, fontSize: 13 }}>No positioning analysis available.</div>;
   const allHooks = (strategy.hooks || []).concat(rarityHook ? [rarityHook] : []);
 
@@ -1503,6 +1674,9 @@ function PositioningTab({ strategy, positionStrength, talkingPoints, rarityHook,
           </Card>
         </div>
       )}
+
+      {/* Networking (deterministic — built from extracted job dimensions) */}
+      <NetworkingSection jobDims={jobDims} intel={intel} T={T} />
     </div>
   );
 }
@@ -4130,6 +4304,7 @@ function Tailor() {
       "responsibilities (array of 3-8 verb-first duties this posting states, in its own words), " +
       "posting_title (the job title as stated, or null), " +
       "company (the company or organization name as stated, or null), " +
+      "team_name (the specific team, division, or org name the posting mentions this role sits within, e.g. 'DT-US Product Engineering' or 'Growth Design' — only if explicitly named, or null), " +
       "mission (one sentence describing the company's mission or what it does, only if the posting states it, or null), " +
       "degree_required (bool), remote_allowed (bool).\n\n" + excerptLabel(budget) + "\n\n" + full.slice(0, budget);
 
@@ -5109,7 +5284,7 @@ function Tailor() {
         {/* RESULTS */}
         {isReady && step === "results" && results && (
           <div>
-            {activeTab === "strategy" && <PositioningTab strategy={positioningStrategy} positionStrength={results.position_strength} talkingPoints={results.talking_points} rarityHook={rarityHook} responsibilityAlignment={responsibilityAlignment} intel={getIntel((profile && profile.discipline) || discipline)} T={T} />}
+            {activeTab === "strategy" && <PositioningTab strategy={positioningStrategy} positionStrength={results.position_strength} talkingPoints={results.talking_points} rarityHook={rarityHook} responsibilityAlignment={responsibilityAlignment} intel={getIntel((profile && profile.discipline) || discipline)} jobDims={jobDims} T={T} />}
             {activeTab === "cover" && <CoverLetterTab coverLetter={results.cover_letter} onGenerate={generateCoverLetter} generating={coverGenerating} onRegenerate={regenerateCoverLetter} regenerating={regenerating} jobDims={jobDims} strategy={positioningStrategy} rarityHook={rarityHook} voiceSummary={voiceSummary} T={T} />}
             {activeTab === "resume" && <ResumeTab suggestions={results.suggestions} talkingPoints={results.talking_points} resumeText={resumeText} onReword={rewordSuggestion} rewordingIdx={rewordingIdx} atsResult={atsResult} customizations={resumeCustomizations} T={T} />}
             {activeTab === "market" && <MarketIntelTab discipline={discipline} seniority={seniority} jobText={jobText} jobDims={jobDims} jobDimsLoading={jobDimsLoading} jobDimsError={jobDimsError} intel={getIntel(discipline)} T={T} />}
