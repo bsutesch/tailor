@@ -3703,6 +3703,83 @@ function SavedJobsPanel({ jobs, applicantSeniority, intel, onClose, onRestore, o
   );
 }
 
+// ─── PERSISTENT STEP NAVIGATION ─────────────────────────────────────────────
+// Shown at the top of every screen (setup steps, main input, and results) so
+// the user always knows where they are and can jump back to re-edit their
+// resume or voice profile without hunting for Settings. Uses the same
+// max-width container as the body below it so the page never reflows when
+// moving between setup and the main app.
+function StepNav({ setupStep, resumeText, resumeFileName, voiceText, voiceFileName, onGoTo, T }) {
+  const steps = [
+    { key: "resume", n: 1, label: "Add resume", loaded: !!resumeText, detail: resumeFileName || null },
+    { key: "voice", n: 2, label: "Voice profile", loaded: !!voiceText, detail: voiceText ? (voiceFileName || "Voice profile loaded") : null },
+    { key: "ready", n: 3, label: "Tailor", loaded: false, detail: null },
+  ];
+  const activeIdx = steps.findIndex(s => s.key === setupStep);
+
+  return (
+    <div style={{ maxWidth: 960, margin: "0 auto", padding: "16px 24px 0" }}>
+      <div style={{ display: "flex", alignItems: "flex-start", gap: 0, marginBottom: 8 }}>
+        {steps.map((s, i) => {
+          const active = i === activeIdx;
+          const done = s.loaded && !active;
+          // Can't jump ahead of a resume — voice and the main app both need it first.
+          const clickable = s.key === "resume" || !!resumeText;
+          return (
+            <div key={s.key} style={{ display: "flex", alignItems: "flex-start", flex: i < steps.length - 1 ? 1 : "none" }}>
+              <button
+                onClick={() => clickable && onGoTo(s.key)}
+                disabled={!clickable}
+                title={clickable ? "Go to " + s.label : "Add your resume first"}
+                style={{
+                  display: "flex", alignItems: "center", gap: 8,
+                  background: "none", border: "none", padding: 0, marginTop: 2,
+                  cursor: clickable ? "pointer" : "default",
+                  opacity: clickable ? 1 : 0.5,
+                  fontFamily: T.font, textAlign: "left",
+                }}
+              >
+                <span style={{
+                  width: 28, height: 28, borderRadius: "50%", flexShrink: 0,
+                  display: "flex", alignItems: "center", justifyContent: "center",
+                  fontSize: 12, fontWeight: 700,
+                  background: done ? T.success : active ? T.accent : T.bgInput,
+                  color: done || active ? "#fff" : T.textMuted,
+                  border: "1px solid " + (done ? T.success : active ? T.accent : T.borderStrong),
+                }}>
+                  {done ? "✓" : s.n}
+                </span>
+                <span style={{ display: "flex", flexDirection: "column" }}>
+                  <span style={{
+                    fontSize: 12, fontWeight: active ? 600 : 400,
+                    color: active ? T.textBright : T.textMuted, whiteSpace: "nowrap",
+                  }}>
+                    {s.label}
+                  </span>
+                  {s.detail && (
+                    <span style={{
+                      fontSize: 10.5, color: T.textDim, whiteSpace: "nowrap",
+                      maxWidth: 170, overflow: "hidden", textOverflow: "ellipsis",
+                    }}>
+                      {s.detail}
+                    </span>
+                  )}
+                </span>
+              </button>
+              {i < steps.length - 1 && (
+                <div style={{
+                  flex: 1, height: 1, margin: "16px 12px 0",
+                  background: s.loaded ? T.success : T.borderStrong,
+                }} />
+              )}
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
 // ─── MAIN ───────────────────────────────────────────────────────────────────
 function Tailor() {
   const [theme, setTheme] = useState("light");
@@ -4446,8 +4523,10 @@ function Tailor() {
 
   const canAnalyze = jobText.trim().length > 50 && resumeText.trim().length > 50;
 
-  // ── Step indicator ──
-  const stepNumber = setupStep === "resume" ? 1 : setupStep === "voice" ? 2 : 3;
+  // Jump between setup steps and the main app from the persistent nav.
+  // setupStep drives which screen renders; `step` (input/loading/results) is
+  // untouched, so returning to "ready" lands back wherever the user left off.
+  const goToSetupStep = (key) => setSetupStep(key);
 
   return (
     <div style={{
@@ -4556,7 +4635,7 @@ function Tailor() {
           </button>
 
           {/* Saved jobs / tracker */}
-          {isReady && (
+          {!!resumeText && (
             <button
               onClick={() => setShowSavedJobs(true)}
               style={{
@@ -4579,7 +4658,7 @@ function Tailor() {
           )}
 
           {/* Save this job */}
-          {step === "results" && (
+          {isReady && step === "results" && (
             <button
               onClick={saveCurrentJob}
               disabled={currentJobSaved}
@@ -4595,7 +4674,7 @@ function Tailor() {
           )}
 
           {/* Settings */}
-          {isReady && (
+          {!!resumeText && (
             <button
               onClick={() => setShowSettings(true)}
               style={{
@@ -4609,7 +4688,7 @@ function Tailor() {
           )}
 
           {/* New analysis */}
-          {step === "results" && (
+          {isReady && step === "results" && (
             <button
               onClick={reset}
               style={{
@@ -4623,6 +4702,17 @@ function Tailor() {
           )}
         </div>
       </div>
+
+      {/* ── STEP NAVIGATION (persists across every screen) ─────────────── */}
+      <StepNav
+        setupStep={setupStep}
+        resumeText={resumeText}
+        resumeFileName={resumeFileName}
+        voiceText={voiceText}
+        voiceFileName={voiceFileName}
+        onGoTo={goToSetupStep}
+        T={T}
+      />
 
       {/* ── ABOUT MODAL ─────────────────────────────────────────────── */}
       {showAbout && (
@@ -4742,48 +4832,10 @@ function Tailor() {
       <div style={{ maxWidth: 960, margin: "0 auto", padding: "24px 24px" }}>
 
         {/* ── SETUP WIZARD ────────────────────────────────────────── */}
+        {/* No inner max-width here — same container as the main app below,
+            so the page does not reflow when setupStep reaches "ready". */}
         {!isReady && (
-          <div style={{ maxWidth: 480, margin: "0 auto" }}>
-            {/* Step indicators */}
-            <div style={{ display: "flex", alignItems: "center", gap: 0, marginBottom: 32 }}>
-              {[
-                { n: 1, label: "Add resume" },
-                { n: 2, label: "Voice profile" },
-                { n: 3, label: "Tailor" },
-              ].map((s, i) => {
-                const done = s.n < stepNumber;
-                const active = s.n === stepNumber;
-                return (
-                  <div key={s.n} style={{ display: "flex", alignItems: "center", flex: i < 2 ? 1 : "none" }}>
-                    <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-                      <div style={{
-                        width: 28, height: 28, borderRadius: "50%", flexShrink: 0,
-                        display: "flex", alignItems: "center", justifyContent: "center",
-                        fontSize: 12, fontWeight: 700,
-                        background: done ? T.success : active ? T.accent : T.bgInput,
-                        color: done || active ? "#fff" : T.textMuted,
-                        border: "1px solid " + (done ? T.success : active ? T.accent : T.borderStrong),
-                      }}>
-                        {done ? "\u2713" : s.n}
-                      </div>
-                      <span style={{
-                        fontSize: 12, fontWeight: active ? 600 : 400,
-                        color: active ? T.textBright : T.textMuted,
-                        whiteSpace: "nowrap",
-                      }}>
-                        {s.label}
-                      </span>
-                    </div>
-                    {i < 2 && (
-                      <div style={{
-                        flex: 1, height: 1, margin: "0 12px",
-                        background: done ? T.success : T.borderStrong,
-                      }} />
-                    )}
-                  </div>
-                );
-              })}
-            </div>
+          <div>
 
             {/* Step 1: Resume */}
             {setupStep === "resume" && (
